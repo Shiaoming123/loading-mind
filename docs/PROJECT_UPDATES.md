@@ -41,17 +41,20 @@ For visual or interaction changes, also check the app manually in a browser at d
 - Degraded execution must be explicit in the graph and in event text.
 - Normal reports must not be generated from failed tools that produced no usable observations.
 - New runtime rules should have helper tests or reducer tests.
+- Deep research reports must preserve source budget limits, source-node traceability, cross-check status, and visualization block coverage.
 
 ## Deployment Change Policy
 
 - Vercel-facing API changes should keep `POST /api/runs` serverless-compatible: no required long-lived memory, background workers, or persistent SSE connection.
 - If snapshot delivery changes, update the frontend replay path, `README.md`, and a runtime smoke test together.
 - Tool orchestration changes should keep registered runner metadata visible through diagnostics so HTTP, local, provider, and future MCP adapters can be inspected.
+- Public demo orchestration must keep snapshot runs bounded enough for Vercel serverless execution.
 
 ## UI Change Policy
 
 - The canvas is the primary product surface. Center readouts, panels, and controls must not obscure core process nodes at common desktop widths.
 - Failed, running, observed, synthesized, and written states must remain visually distinguishable without relying only on text.
+- Long report blocks must remain readable at desktop and mobile widths, including tables and Mermaid/code blocks.
 - Mobile layouts should keep document-flow behavior unless the change explicitly targets mobile.
 
 ## Release Checklist

@@ -41,6 +41,13 @@ export default async function handler(req, res) {
     runtime: "loading-mind-vercel",
     delivery: "snapshot",
     demoFallback: true,
+    orchestration: {
+      mode: "demo_deep_research",
+      sourceBudget: 12,
+      snapshotMode: true,
+      fallbackMode: process.env.LOADING_MIND_FORCE_DEMO_TOOLS === "1" ? "forced_demo_tools" : "demo_fallback_allowed",
+      mcpAdapterAvailable: registry.list().some((tool) => tool.name === "mcp.invoke")
+    },
     tools: registry.list(),
     network: {
       webSearch: searchProbe,

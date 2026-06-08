@@ -14,21 +14,50 @@ export type ArtifactKind = "plan" | "signal" | "insight" | "draft" | "final";
 
 export type VisualMode = "cinematic" | "system";
 
-export type GraphCluster = "intent" | "ontology" | "evidence" | "reasoning" | "report";
+export type ResearchMode = "demo_deep_research";
+
+export type VisualizationMode = "auto";
+
+export type GraphCluster =
+  | "intent"
+  | "ontology"
+  | "plan"
+  | "search"
+  | "sources"
+  | "evidence"
+  | "verification"
+  | "synthesis"
+  | "reasoning"
+  | "visualization"
+  | "report";
 
 export type GraphNodeKind =
   | "task_intent"
   | "ontology"
+  | "research_plan"
+  | "search_query"
+  | "source"
   | "entity"
   | "evidence"
   | "tool_call"
   | "observation"
   | "claim"
+  | "counterclaim"
+  | "verification"
+  | "example"
+  | "visualization"
   | "section";
 
 export type GraphEdgeKind =
   | "extracts"
+  | "queries"
+  | "returns_source"
+  | "extracts_evidence"
   | "supports"
+  | "contradicts"
+  | "verifies"
+  | "illustrates"
+  | "feeds_visual"
   | "observes"
   | "uses_tool"
   | "synthesizes"
@@ -63,8 +92,22 @@ export type ProviderPublicSummary = Omit<ProviderConfig, "apiKey"> & {
 
 export type ToolCallRecord = {
   id: string;
-  toolName: "web_search" | "web_fetch" | "document_read" | "evidence_extract" | "llm_analyze" | "report_write";
-  input: Record<string, string | number | boolean>;
+  toolName:
+    | "web_search"
+    | "web_fetch"
+    | "document_read"
+    | "evidence_extract"
+    | "llm_analyze"
+    | "search"
+    | "fetch"
+    | "extract"
+    | "rank_source"
+    | "cross_check"
+    | "case_find"
+    | "chart_plan"
+    | "report_write"
+    | "mcp.invoke";
+  input: Record<string, unknown>;
   outputSummary?: string;
   startedAt: number;
   endedAt?: number;
@@ -79,6 +122,11 @@ export type EvidenceRecord = {
   url?: string;
   quote: string;
   source: string;
+  sourceType?: string;
+  date?: string;
+  claim?: string;
+  supports?: string[];
+  contradicts?: string[];
   confidence: number;
   capturedAt: number;
   excluded?: boolean;
@@ -211,12 +259,45 @@ export type ReportSection = {
   sourceNodeIds: string[];
 };
 
+export type ArtifactBlock =
+  | {
+      id: string;
+      type: "markdown";
+      title?: string;
+      body: string;
+      sourceNodeIds?: string[];
+    }
+  | {
+      id: string;
+      type: "table" | "source_matrix";
+      title: string;
+      columns: string[];
+      rows: Array<Record<string, string | number | boolean>>;
+      sourceNodeIds?: string[];
+    }
+  | {
+      id: string;
+      type: "mermaid";
+      title: string;
+      code: string;
+      sourceNodeIds?: string[];
+    }
+  | {
+      id: string;
+      type: "claim_graph";
+      title: string;
+      nodes: Array<{ id: string; label: string; kind: GraphNodeKind }>;
+      edges: Array<{ from: string; to: string; kind: GraphEdgeKind }>;
+      sourceNodeIds?: string[];
+    };
+
 export type Artifact = {
   id: string;
   kind: ArtifactKind;
   title: string;
   body: string;
   sections?: ReportSection[];
+  blocks?: ArtifactBlock[];
 };
 
 export type LoadingEvent = {
@@ -252,6 +333,9 @@ export type AgentRun = {
   scope: string;
   depth: "fast" | "standard" | "deep";
   sources: string[];
+  researchMode?: ResearchMode;
+  sourceBudget?: number;
+  visualization?: VisualizationMode;
   provider?: ProviderPublicSummary;
   status: RunStatus;
   createdAt: number;

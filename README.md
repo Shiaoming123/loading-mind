@@ -8,9 +8,10 @@ The product is no longer a prerecorded loading demo. A user submits a research q
 
 - Runs a local Agent runtime through Vite middleware.
 - Streams run events over Server-Sent Events.
-- Visualizes task intent, ontology, tool calls, observations, evidence, claims, and report sections as a force-directed canvas.
+- Visualizes task intent, research plans, search branches, sources, evidence, verification, examples, visualizations, claims, and report sections as a force-directed canvas.
 - Exposes tool I/O, source refs, episodes, attributes, and report mapping through a node inspector.
 - Fails loudly when critical tools fail instead of silently synthesizing from empty results.
+- Runs the default `demo_deep_research` orchestration with an 8-12 source budget, cross-checking, example generation, and structured report blocks.
 - Persists local run events under `.agent-runs/` for inspection while keeping them out of git.
 
 ## Tech Stack
@@ -51,7 +52,13 @@ The app can run as a public Vercel demo without long-lived server memory. In pro
 Vercel endpoints:
 
 - `POST /api/runs` creates and completes a serverless snapshot run.
-- `GET /api/diagnostics` reports delivery mode, registered tool runners, and basic network probes.
+- `GET /api/diagnostics` reports delivery mode, orchestration metadata, registered tool runners, and basic network probes.
+
+Default public run interface:
+
+- `researchMode: "demo_deep_research"`
+- `sourceBudget: 12` with a hard cap of 12
+- `visualization: "auto"`
 
 Useful environment variables:
 
@@ -64,18 +71,20 @@ Local development still uses the Vite middleware and SSE runtime so pause, resum
 ## Demo Script
 
 1. Enter a real research question and start the run.
-2. Watch the graph grow from task intent to ontology, tool calls, evidence, claims, and report sections.
+2. Watch the graph grow from task intent to research plan, search branches, sources, evidence cards, verification, examples, visualizations, and report sections.
 3. Click a node to inspect summary, attributes, episodes, source refs, tool input/output, and report mapping.
 4. Pause/resume/cancel the run from the control cluster.
 5. Retry a failed tool node or exclude an evidence node from the inspector.
-6. When the report appears, click a section to highlight the source graph path.
+6. When the long report appears, inspect the table of contents, source matrix, cross-check table, Mermaid structure, and claim graph.
+7. Click a section or block to highlight the source graph path.
 
 ## Design Intent
 
 - Waiting is treated as an observable work surface, not an empty spinner.
 - Tool calls are first-class graph nodes; success and failure are both visible.
 - Evidence nodes carry source refs and quotes, so users can inspect what the Agent used.
-- Claims and report sections are generated from visible process nodes.
+- Claims and report sections are generated from visible process nodes after cross-checking source support.
+- Visual blocks make the report inspectable before reading every paragraph.
 - The final report is not detached from the process; every section maps back to source node IDs.
 
 ## Runtime Failure Rules

@@ -67,11 +67,18 @@ export const phases: Array<{
 const kindRadius: Record<GraphNodeKind, number> = {
   task_intent: 17,
   ontology: 14,
+  research_plan: 14,
+  search_query: 11,
+  source: 11,
   entity: 11,
   evidence: 11,
   tool_call: 13,
   observation: 11,
   claim: 14,
+  counterclaim: 13,
+  verification: 13,
+  example: 11,
+  visualization: 15,
   section: 15
 };
 

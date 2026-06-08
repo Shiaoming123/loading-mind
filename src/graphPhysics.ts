@@ -54,27 +54,47 @@ export type NodeRenderToken = {
 const kindRadius: Record<GraphNodeKind, number> = {
   task_intent: 19,
   ontology: 15,
+  research_plan: 15,
+  search_query: 12,
+  source: 11,
   entity: 12,
   evidence: 12,
   tool_call: 14,
   observation: 12,
   claim: 15,
+  counterclaim: 14,
+  verification: 14,
+  example: 12,
+  visualization: 16,
   section: 16
 };
 
 const clusterIndex: Record<GraphCluster, number> = {
   intent: 0,
   ontology: 1,
-  evidence: 2,
-  reasoning: 3,
-  report: 4
+  plan: 2,
+  search: 3,
+  sources: 4,
+  evidence: 5,
+  verification: 6,
+  synthesis: 7,
+  reasoning: 8,
+  visualization: 9,
+  report: 10
 };
 
 const edgePriority: Record<GraphEdgeKind, number> = {
   becomes_section: 6,
+  feeds_visual: 6,
+  verifies: 6,
   synthesizes: 5,
   supports: 4,
+  contradicts: 4,
+  illustrates: 4,
   uses_tool: 3,
+  extracts_evidence: 3,
+  returns_source: 3,
+  queries: 2,
   observes: 2,
   extracts: 1
 };
@@ -100,13 +120,13 @@ export function deriveNodeTier(node: GraphNode): GraphNodeTier {
   if (node.kind === "task_intent") {
     return "core";
   }
-  if (node.kind === "ontology") {
+  if (node.kind === "ontology" || node.kind === "research_plan") {
     return "schema";
   }
-  if (node.kind === "tool_call" || node.kind === "observation") {
+  if (node.kind === "tool_call" || node.kind === "observation" || node.kind === "search_query" || node.kind === "source") {
     return "operation";
   }
-  if (node.kind === "claim" || node.kind === "section") {
+  if (node.kind === "claim" || node.kind === "counterclaim" || node.kind === "verification" || node.kind === "visualization" || node.kind === "section") {
     return "output";
   }
   return "record";
@@ -128,7 +148,7 @@ export function deriveNodeImportance(node: GraphNode) {
       return 0.7;
     case "record":
     default:
-      return node.kind === "evidence" ? 0.66 : 0.58;
+      return node.kind === "evidence" || node.kind === "example" ? 0.66 : 0.58;
   }
 }
 
@@ -267,10 +287,22 @@ export function clusterAnchor(cluster: GraphCluster | undefined, viewport: Graph
   switch (cluster) {
     case "ontology":
       return { x: centerX - spreadX * 0.5, y: centerY - spreadY * 0.82 };
+    case "plan":
+      return { x: centerX - spreadX * 0.1, y: centerY - spreadY * 0.9 };
+    case "search":
+      return { x: centerX + spreadX * 0.58, y: centerY - spreadY * 0.68 };
+    case "sources":
+      return { x: centerX + spreadX * 1.02, y: centerY - spreadY * 0.18 };
     case "evidence":
-      return { x: centerX + spreadX * 0.9, y: centerY - spreadY * 0.12 };
+      return { x: centerX + spreadX * 0.86, y: centerY + spreadY * 0.28 };
+    case "verification":
+      return { x: centerX + spreadX * 0.18, y: centerY + spreadY * 0.78 };
+    case "synthesis":
+      return { x: centerX - spreadX * 0.54, y: centerY + spreadY * 0.62 };
     case "reasoning":
       return { x: centerX - spreadX * 0.72, y: centerY + spreadY * 0.52 };
+    case "visualization":
+      return { x: centerX + spreadX * 0.88, y: centerY + spreadY * 0.88 };
     case "report":
       return { x: centerX + spreadX * 0.66, y: centerY + spreadY * 0.72 };
     case "intent":

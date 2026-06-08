@@ -85,6 +85,23 @@ export function runToMarkdown(run) {
     lines.push("No final report was recorded.");
   } else {
     lines.push(report.body, "");
+    for (const block of report.blocks ?? []) {
+      lines.push(`### ${block.title || block.id}`, "");
+      if (block.type === "markdown") {
+        lines.push(block.body, "");
+      } else if (block.type === "mermaid") {
+        lines.push("```mermaid", block.code, "```", "");
+      } else if (block.type === "table" || block.type === "source_matrix") {
+        lines.push(`| ${block.columns.join(" | ")} |`);
+        lines.push(`| ${block.columns.map(() => "---").join(" | ")} |`);
+        for (const row of block.rows) {
+          lines.push(`| ${block.columns.map((column) => String(row[column] ?? "").replace(/\|/g, "\\|")).join(" | ")} |`);
+        }
+        lines.push("");
+      } else if (block.type === "claim_graph") {
+        lines.push(`Claim graph: ${block.nodes.length} nodes, ${block.edges.length} edges.`, "");
+      }
+    }
     for (const section of report.sections ?? []) {
       lines.push(`### ${section.title}`, "");
       lines.push(section.body, "");

@@ -823,6 +823,129 @@ button {
   border-top: 1px solid rgba(47, 43, 37, 0.1);
 }
 
+.report-toc {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.report-toc button {
+  border: 1px solid rgba(47, 43, 37, 0.12);
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: rgba(255, 252, 244, 0.58);
+  color: var(--graphite);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.report-blocks {
+  display: grid;
+  gap: 14px;
+  margin-top: 20px;
+}
+
+.report-block {
+  display: grid;
+  gap: 10px;
+  border-left: 1px solid rgba(62, 133, 129, 0.24);
+  padding: 12px 0 12px 14px;
+}
+
+.report-block-focus {
+  width: fit-content;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--graphite);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 620;
+  text-align: left;
+}
+
+.report-block-focus:disabled {
+  cursor: default;
+}
+
+.report-block p {
+  font-size: 13px;
+  line-height: 1.78;
+}
+
+.report-block em {
+  color: rgba(47, 43, 37, 0.44);
+  font-size: 10px;
+  font-style: normal;
+  line-height: 1.5;
+}
+
+.report-table-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.report-table-wrap table {
+  width: 100%;
+  min-width: 420px;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.report-table-wrap th,
+.report-table-wrap td {
+  border-bottom: 1px solid rgba(47, 43, 37, 0.1);
+  padding: 7px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.report-table-wrap th {
+  color: var(--amber);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.mermaid-block {
+  overflow-x: auto;
+  margin: 0;
+  border: 1px solid rgba(47, 43, 37, 0.1);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(255, 252, 244, 0.58);
+  color: var(--graphite);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.claim-graph-block {
+  display: grid;
+  grid-template-columns: 72px 72px 1fr;
+  gap: 10px;
+  align-items: center;
+}
+
+.claim-graph-block div {
+  display: grid;
+  gap: 2px;
+  border: 1px solid rgba(47, 43, 37, 0.1);
+  padding: 8px;
+}
+
+.claim-graph-block strong {
+  color: var(--amber);
+  font-size: 18px;
+}
+
+.claim-graph-block span {
+  color: var(--graphite-soft);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .report-article button {
   display: grid;
   gap: 7px;
@@ -915,6 +1038,14 @@ button {
   .task-pill {
     width: max-content;
     max-width: 100%;
+  }
+
+  .claim-graph-block {
+    grid-template-columns: 1fr;
+  }
+
+  .report-table-wrap table {
+    min-width: 360px;
   }
 
   .stage-rail {

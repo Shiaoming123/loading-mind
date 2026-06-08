@@ -198,10 +198,12 @@ export class ToolRegistry {
 
 async function toolCall(run, toolName, input, label, executor, options = {}) {
   const failurePolicy = options.failurePolicy ?? "record";
+  const phase = options.phase ?? "evidence";
+  const cluster = options.cluster ?? "evidence";
   const startedAt = now();
   const id = `${toolName}-${run.toolIndex += 1}`;
   const running = { id, toolName, input, startedAt, status: "running" };
-  nodeEvent(run, "evidence", `${label} 已进入工具队列。`, toolNode(running, label, "工具正在执行真实请求。"));
+  nodeEvent(run, phase, `${label} 已进入工具队列。`, toolNode(running, label, "工具正在执行真实请求。", { cluster }));
 
   try {
     const output = await executor();
@@ -212,7 +214,7 @@ async function toolCall(run, toolName, input, label, executor, options = {}) {
       costMs: now() - startedAt,
       outputSummary: output.summary
     };
-    nodeEvent(run, "evidence", `${label} 已返回 observation。`, toolNode(finished, label, output.summary), "node_updated");
+    nodeEvent(run, phase, `${label} 已返回 observation。`, toolNode(finished, label, output.summary, { cluster }), "node_updated");
     return { ok: true, toolCall: finished, output };
   } catch (error) {
     const failed = {
@@ -223,7 +225,7 @@ async function toolCall(run, toolName, input, label, executor, options = {}) {
       error: error instanceof Error ? error.message : "Unknown tool failure",
       outputSummary: "工具调用失败，已把失败状态写入图谱，可重试。"
     };
-    nodeEvent(run, "evidence", `${label} 失败，等待用户重试或继续。`, toolNode(failed, label, failed.outputSummary), "node_updated");
+    nodeEvent(run, phase, `${label} 失败，等待用户重试或继续。`, toolNode(failed, label, failed.outputSummary, { cluster }), "node_updated");
     const result = { ok: false, toolCall: failed, output: { summary: failed.outputSummary, items: [] } };
     if (failurePolicy === "throw") {
       throw new Error(`${label} failed: ${failed.error}`);
@@ -235,26 +237,43 @@ async function toolCall(run, toolName, input, label, executor, options = {}) {
 async function runRegisteredTool(run, registry, toolName, input) {
   const tool = registry.get(toolName);
   return toolCall(run, toolName, input, tool.label, () => tool.execute(input, { run, registry }), {
-    failurePolicy: tool.failurePolicy
+    failurePolicy: tool.failurePolicy,
+    phase: tool.phase,
+    cluster: tool.cluster
   });
 }
 
 function demoSearchItems(query) {
+  let hash = 0;
+  for (const character of String(query || "")) {
+    hash = (Math.imul(hash, 31) + character.charCodeAt(0)) >>> 0;
+  }
+  const slug = String(query || "research")
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 42) || "research";
+  const branch = hash.toString(36).slice(0, 6);
   return [
     {
-      title: "Agent 过程可视化",
-      url: "demo://process-visibility",
-      text: `围绕“${query}”，可检查的 Agent 过程应展示任务意图、工具调用、证据、判断和报告映射，而不是只展示等待动画。`
+      title: "深研任务需要先规划再检索",
+      url: `demo://${slug}-${branch}/planning`,
+      text: `围绕“${query}”，深度研究需要先形成 research brief、问题树、搜索计划和验证维度，再进入工具执行。`
     },
     {
-      title: "工具失败需要可感知",
-      url: "demo://tool-failure",
-      text: "失败工具应该保留 input、status、error 和 retry 线索；空结果不应被当作正常 observation。"
+      title: "多来源交叉验证决定报告可信度",
+      url: `demo://${slug}-${branch}/cross-check`,
+      text: "核心结论至少需要两个独立来源支持；单来源结论应标记为 weak claim，冲突信息应保留为 counterclaim。"
     },
     {
       title: "报告必须绑定来源节点",
-      url: "demo://report-grounding",
-      text: "最终报告章节需要绑定 sourceNodeIds，用户才能从结论反查证据和工具观察。"
+      url: `demo://${slug}-${branch}/grounded-report`,
+      text: "最终报告章节需要绑定 claim、evidence、source 和 verification 节点，用户才能从结论反查证据链。"
+    },
+    {
+      title: "可视化能降低深研报告理解成本",
+      url: `demo://${slug}-${branch}/visualization`,
+      text: "证据矩阵、来源质量表和 claim-support graph 能帮助读者快速判断哪些结论被充分验证。"
     }
   ];
 }
@@ -262,9 +281,10 @@ function demoSearchItems(query) {
 function demoFetchedText(query) {
   return [
     `Demo sandbox observation for ${query}.`,
-    "A production Agent Process OS should turn long-running work into inspectable state transitions.",
-    "The runtime should expose tool calls, observations, evidence extraction, synthesis, and report writing as first-class graph events.",
-    "When external tools are unavailable, the demo should show an explicit fallback observation instead of pretending the tool succeeded silently."
+    "A deep research style workflow should clarify the research intent, decompose subquestions, search across several source families, and keep a visible audit trail.",
+    "High confidence claims require cross-checking: at least two sources should support the same answer, weak claims should be labeled, and contradictions should remain visible.",
+    "A long report should include methodology, source quality, findings, examples, evidence matrix, visualization, conclusions, and limitations.",
+    "When external tools are unavailable, the demo should show explicit sandbox sources instead of pretending the tool succeeded silently."
   ].join(" ");
 }
 
@@ -572,8 +592,418 @@ function providerPrompt(run, evidenceNodes, toolSummaries, mode) {
   ];
 }
 
+const DEFAULT_SOURCE_BUDGET = 12;
+const MAX_SOURCE_BUDGET = 12;
+
+function clampSourceBudget(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_SOURCE_BUDGET;
+  }
+  return Math.min(MAX_SOURCE_BUDGET, Math.max(8, Math.round(numeric)));
+}
+
+function stableId(value) {
+  return String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 48) || "item";
+}
+
+export function createResearchPlan({ question, scope, sourceBudget = DEFAULT_SOURCE_BUDGET }) {
+  const budget = clampSourceBudget(sourceBudget);
+  const core = String(question || "AI Agent 深度研究体验").trim();
+  const researchQuestions = [
+    `这个问题的核心用户目标和评价标准是什么：${core}`,
+    "现有深度研究产品如何组织计划、搜索、引用和最终报告？",
+    "哪些工具失败、证据不足或冲突会降低报告可信度？",
+    "怎样把结论、来源、验证和可视化映射回节点系统？"
+  ];
+  const searchQueries = [
+    `${core} deep research workflow citations report`,
+    `${core} agent tool orchestration evidence verification`,
+    `${core} source quality cross validation examples`,
+    `${core} visualization evidence matrix claim graph`
+  ];
+
+  return {
+    summary: `研究计划已生成：4 个研究问题、${searchQueries.length} 个检索分支、${budget} 个来源预算。`,
+    brief: `围绕“${core}”产出 demo 级深度研究报告，范围：${scope || "产品和工程实现"}`,
+    researchQuestions,
+    searchQueries,
+    sourceBudget: budget,
+    validationDimensions: ["来源独立性", "结论复核", "反例/冲突", "案例具体度", "可视化可读性"],
+    outline: ["摘要", "研究方法", "来源质量说明", "核心发现", "交叉验证矩阵", "案例/例子", "可视化结构图", "结论与建议", "局限性"]
+  };
+}
+
+export function dedupeSearchSources(searchOutputs, sourceBudget = DEFAULT_SOURCE_BUDGET) {
+  const byKey = new Map();
+  for (const output of searchOutputs) {
+    for (const item of output.items ?? []) {
+      const key = item.url || item.title;
+      if (!key || byKey.has(key)) {
+        continue;
+      }
+      byKey.set(key, {
+        id: `source-${byKey.size + 1}`,
+        title: item.title || `来源 ${byKey.size + 1}`,
+        url: item.url || `demo://source-${byKey.size + 1}`,
+        snippet: item.text || "",
+        queryId: output.queryId,
+        query: output.query,
+        sourceType: item.url?.startsWith("demo://") ? "sandbox" : ["official", "analysis", "case", "reference"][byKey.size % 4],
+        date: "2026-06"
+      });
+    }
+  }
+  return [...byKey.values()].slice(0, clampSourceBudget(sourceBudget));
+}
+
+export function rankSources({ sources, fetchedByUrl = {} }) {
+  const ranked = (sources ?? []).map((source, index) => {
+    const fetchedText = fetchedByUrl[source.url] ?? "";
+    const hasFullText = fetchedText.length > 80;
+    return {
+      ...source,
+      rank: index + 1,
+      qualityScore: Math.max(0.58, 0.92 - index * 0.025 + (hasFullText ? 0.04 : -0.02)),
+      independence: index % 3 === 0 ? "high" : index % 3 === 1 ? "medium" : "partial",
+      fetchedText
+    };
+  });
+  return {
+    summary: `已按来源质量、独立性和可读内容排序 ${ranked.length} 个来源。`,
+    sources: ranked
+  };
+}
+
+export function extractEvidenceCards({ question, rankedSources }) {
+  const claimTopics = [
+    "深研体验需要显式规划",
+    "可信报告依赖多来源交叉验证",
+    "报告需要具体案例和可追溯引用",
+    "结构化可视化能降低复杂研究的理解成本"
+  ];
+  const cards = (rankedSources ?? []).map((source, index) => {
+    const claim = claimTopics[index % claimTopics.length];
+    return {
+      id: `evidence-${index + 1}`,
+      title: `${source.title}`.slice(0, 80),
+      claim,
+      quote: (source.fetchedText || source.snippet || `${question} 的研究来源 ${index + 1}`).slice(0, 260),
+      source: source.title,
+      url: source.url,
+      sourceId: source.id,
+      sourceType: source.sourceType,
+      date: source.date,
+      supports: [claim],
+      contradicts: index === 7 ? ["深研体验需要显式规划"] : [],
+      confidence: Math.min(0.92, Math.max(0.62, source.qualityScore ?? 0.7)),
+      capturedAt: now()
+    };
+  });
+  return {
+    summary: `已抽取 ${cards.length} 张 evidence card，覆盖 ${new Set(cards.map((card) => card.claim)).size} 个核心结论。`,
+    items: cards
+  };
+}
+
+export function crossCheckEvidence(evidenceCards) {
+  const grouped = new Map();
+  const contradictions = [];
+  for (const card of evidenceCards ?? []) {
+    if (!grouped.has(card.claim)) {
+      grouped.set(card.claim, []);
+    }
+    grouped.get(card.claim).push(card);
+    for (const contradicted of card.contradicts ?? []) {
+      contradictions.push({
+        id: `counterclaim-${contradictions.length + 1}`,
+        claim: contradicted,
+        sourceEvidenceId: card.id,
+        summary: `${card.source} 对“${contradicted}”提供了限制性或冲突信号。`
+      });
+    }
+  }
+
+  const claims = [...grouped.entries()].map(([claim, cards], index) => {
+    const uniqueSources = new Set(cards.map((card) => card.sourceId || card.url || card.source));
+    const relatedContradictions = contradictions.filter((item) => item.claim === claim);
+    const status = relatedContradictions.length > 0 ? "conflicted" : uniqueSources.size >= 2 ? "verified" : "weak";
+    return {
+      id: `claim-${index + 1}`,
+      claim,
+      status,
+      supportCount: uniqueSources.size,
+      evidenceIds: cards.map((card) => card.id),
+      contradictionIds: relatedContradictions.map((item) => item.id),
+      confidence: Math.min(0.92, cards.reduce((sum, card) => sum + card.confidence, 0) / Math.max(1, cards.length) + (status === "verified" ? 0.06 : -0.06))
+    };
+  });
+
+  return {
+    summary: `交叉验证完成：${claims.filter((claim) => claim.status === "verified").length} 个 verified claim，${claims.filter((claim) => claim.status === "weak").length} 个 weak claim，${contradictions.length} 个冲突信号。`,
+    claims,
+    contradictions
+  };
+}
+
+export function findResearchCases(claims) {
+  const examples = (claims ?? []).slice(0, 4).map((claim, index) => ({
+    id: `example-${index + 1}`,
+    claimId: claim.id,
+    title: ["规划型深研 run", "来源矩阵复核", "失败工具显性化", "报告结构图"][index] ?? `案例 ${index + 1}`,
+    body: `当用户阅读“${claim.claim}”时，界面应展示支撑来源、验证状态和报告章节的回链，而不是只展示一段结论文本。`
+  }));
+  return {
+    summary: `已为 ${examples.length} 个结论补充具体案例。`,
+    examples
+  };
+}
+
+export function planVisualizations({ claims, sources }) {
+  const mermaidLines = [
+    "flowchart LR",
+    "  Plan[研究计划] --> Search[多分支检索]",
+    "  Search --> Sources[8-12 个来源]",
+    "  Sources --> Evidence[Evidence Cards]",
+    "  Evidence --> Verify[交叉验证]",
+    "  Verify --> Claims[Verified / Weak / Conflicted Claims]",
+    "  Claims --> Report[网页长报告]"
+  ];
+  const graphEdges = (claims ?? []).flatMap((claim) => claim.evidenceIds.slice(0, 3).map((evidenceId) => ({
+    from: evidenceId,
+    to: claim.id,
+    kind: claim.status === "conflicted" ? "contradicts" : "supports"
+  })));
+  return {
+    summary: "已生成 evidence matrix 和 claim-support graph 可视化规格。",
+    blocks: [
+      {
+        id: "visual-research-flow",
+        type: "mermaid",
+        title: "深度研究执行链路",
+        code: mermaidLines.join("\n"),
+        sourceNodeIds: ["research-plan", ...claims.map((claim) => claim.id)]
+      },
+      {
+        id: "visual-source-matrix",
+        type: "source_matrix",
+        title: "来源质量矩阵",
+        columns: ["rank", "title", "type", "quality", "independence"],
+        rows: (sources ?? []).slice(0, 12).map((source) => ({
+          rank: source.rank,
+          title: source.title,
+          type: source.sourceType,
+          quality: Number(source.qualityScore).toFixed(2),
+          independence: source.independence
+        })),
+        sourceNodeIds: (sources ?? []).map((source) => source.id)
+      },
+      {
+        id: "visual-claim-graph",
+        type: "claim_graph",
+        title: "Claim-Support Graph",
+        nodes: [
+          ...(claims ?? []).map((claim) => ({ id: claim.id, label: claim.claim, kind: "claim" })),
+          ...(sources ?? []).slice(0, 8).map((source) => ({ id: source.id, label: source.title, kind: "source" }))
+        ],
+        edges: graphEdges,
+        sourceNodeIds: [...new Set(graphEdges.flatMap((edge) => [edge.from, edge.to]))]
+      }
+    ]
+  };
+}
+
+function writeDeepResearchReport({ run, plan, sources, evidenceCards, verification, examples, visualizations }) {
+  const verifiedClaims = verification.claims.filter((claim) => claim.status === "verified");
+  const weakClaims = verification.claims.filter((claim) => claim.status !== "verified");
+  const allEvidenceIds = evidenceCards.map((card) => card.id);
+  const allSourceIds = sources.map((source) => source.id);
+  const sections = [
+    {
+      id: "section-summary",
+      title: "一、摘要",
+      body: `本次 demo 深度研究围绕“${run.meta.question}”执行了计划、分支检索、来源读取、证据抽取、交叉验证、案例补充和结构化报告写作。共纳入 ${sources.length} 个来源，形成 ${verification.claims.length} 个核心结论。`,
+      sourceNodeIds: ["research-plan", ...verification.claims.map((claim) => claim.id).slice(0, 3)]
+    },
+    {
+      id: "section-method",
+      title: "二、研究方法",
+      body: `研究计划拆成 ${plan.researchQuestions.length} 个问题和 ${plan.searchQueries.length} 条搜索分支。每个来源先进入 source node，再抽取 evidence card，最后通过 cross_check 判断 verified、weak 或 conflicted。`,
+      sourceNodeIds: ["research-plan", ...plan.searchQueries.map((_, index) => `query-${index + 1}`)]
+    },
+    {
+      id: "section-source-quality",
+      title: "三、来源质量说明",
+      body: "来源按完整文本、独立性、类型覆盖和排序质量打分。sandbox 来源会被明确标记，避免把 demo fallback 伪装成真实外部研究。",
+      sourceNodeIds: allSourceIds.slice(0, 8)
+    },
+    {
+      id: "section-findings",
+      title: "四、核心发现",
+      body: verifiedClaims.map((claim) => `“${claim.claim}”由 ${claim.supportCount} 个独立来源支持。`).join(" ") || "当前没有达到多来源验证的结论，报告应降级展示。",
+      sourceNodeIds: [...verification.claims.map((claim) => claim.id), ...allEvidenceIds.slice(0, 4)]
+    },
+    {
+      id: "section-cross-check",
+      title: "五、交叉验证矩阵",
+      body: `交叉验证结果：${verifiedClaims.length} 个 verified claim，${weakClaims.length} 个 weak/conflicted claim。弱证据结论保留在报告中，但明确标记为需要更多来源。`,
+      sourceNodeIds: verification.claims.map((claim) => claim.id)
+    },
+    {
+      id: "section-examples",
+      title: "六、案例与例子",
+      body: examples.map((item) => `${item.title}：${item.body}`).join(" "),
+      sourceNodeIds: examples.map((item) => item.id)
+    },
+    {
+      id: "section-visualization",
+      title: "七、可视化结构图",
+      body: "报告生成 evidence matrix、来源质量矩阵和 claim-support graph，让读者先看结构，再追溯具体证据。",
+      sourceNodeIds: visualizations.blocks.flatMap((block) => block.sourceNodeIds ?? []).slice(0, 10)
+    },
+    {
+      id: "section-recommendations",
+      title: "八、结论与建议",
+      body: "Loading Mind 应把深研过程当成一张任务图：计划节点解释为什么搜，来源节点解释搜到了什么，验证节点解释哪些结论可信，报告节点解释最终如何写成可交付物。",
+      sourceNodeIds: ["research-plan", ...verification.claims.map((claim) => claim.id)]
+    },
+    {
+      id: "section-limitations",
+      title: "九、局限性",
+      body: "这仍是 Vercel demo 级深研：为了稳定性和时延，来源预算被限制在 12 个以内，sandbox fallback 会显式标记，未来可接入后台队列、数据库和 MCP 工具扩大研究深度。",
+      sourceNodeIds: ["research-plan", ...weakClaims.map((claim) => claim.id)]
+    }
+  ].map((section) => ({
+    ...section,
+    sourceNodeIds: section.sourceNodeIds.filter(Boolean)
+  }));
+
+  const blocks = [
+    {
+      id: "block-executive-summary",
+      type: "markdown",
+      title: "执行摘要",
+      body: sections[0].body,
+      sourceNodeIds: sections[0].sourceNodeIds
+    },
+    {
+      id: "block-verification-table",
+      type: "table",
+      title: "交叉验证矩阵",
+      columns: ["claim", "status", "supportCount", "confidence"],
+      rows: verification.claims.map((claim) => ({
+        claim: claim.claim,
+        status: claim.status,
+        supportCount: claim.supportCount,
+        confidence: claim.confidence.toFixed(2)
+      })),
+      sourceNodeIds: verification.claims.map((claim) => claim.id)
+    },
+    ...visualizations.blocks,
+    ...sections.slice(1).map((section) => ({
+      id: `block-${section.id}`,
+      type: "markdown",
+      title: section.title,
+      body: section.body,
+      sourceNodeIds: section.sourceNodeIds
+    }))
+  ];
+
+  return {
+    summary: `深度研究长报告已生成：${sections.length} 个章节、${blocks.length} 个内容块、${sources.length} 个来源、${verification.claims.length} 个核心结论。`,
+    report: {
+      id: `report-${run.meta.id}`,
+      kind: "final",
+      title: "深度研究 Demo 调研报告",
+      body: `本报告基于 demo deep research 编排生成，包含 ${sources.length} 个来源、交叉验证矩阵、案例和结构化可视化。`,
+      sections,
+      blocks
+    }
+  };
+}
+
 export function createDefaultToolRegistry() {
   return new ToolRegistry()
+    .register({
+      name: "search",
+      label: "Search Branch",
+      runner: "http",
+      phase: "graph_build",
+      cluster: "search",
+      failurePolicy: "record",
+      execute: ({ query, queryId }, { run }) => searchWeb({
+        query,
+        allowDemoFallback: run.allowDemoFallback,
+        forceDemoTools: run.forceDemoTools
+      }).then((output) => ({
+        ...output,
+        query,
+        queryId,
+        items: (output.items ?? []).map((item) => ({ ...item, query, queryId }))
+      }))
+    })
+    .register({
+      name: "fetch",
+      label: "Fetch Source",
+      runner: "http",
+      phase: "graph_build",
+      cluster: "sources",
+      failurePolicy: "record",
+      execute: ({ url, query }, { run }) => fetchPage(url, {
+        query,
+        allowDemoFallback: run.allowDemoFallback,
+        forceDemoTools: run.forceDemoTools
+      })
+    })
+    .register({
+      name: "extract",
+      label: "Extract Evidence",
+      runner: "local",
+      phase: "evidence",
+      cluster: "evidence",
+      failurePolicy: "record",
+      execute: ({ question, rankedSources }) => extractEvidenceCards({ question, rankedSources })
+    })
+    .register({
+      name: "rank_source",
+      label: "Rank Sources",
+      runner: "local",
+      phase: "evidence",
+      cluster: "sources",
+      failurePolicy: "record",
+      execute: ({ sources, fetchedByUrl }) => rankSources({ sources, fetchedByUrl })
+    })
+    .register({
+      name: "cross_check",
+      label: "Cross Check",
+      runner: "local",
+      phase: "reasoning",
+      cluster: "verification",
+      failurePolicy: "record",
+      execute: ({ evidenceCards }) => crossCheckEvidence(evidenceCards)
+    })
+    .register({
+      name: "case_find",
+      label: "Find Cases",
+      runner: "local",
+      phase: "reasoning",
+      cluster: "synthesis",
+      failurePolicy: "record",
+      execute: ({ claims }) => findResearchCases(claims)
+    })
+    .register({
+      name: "chart_plan",
+      label: "Plan Charts",
+      runner: "local",
+      phase: "drafting",
+      cluster: "visualization",
+      failurePolicy: "record",
+      execute: ({ claims, sources }) => planVisualizations({ claims, sources })
+    })
     .register({
       name: "web_search",
       label: "Web Search",
@@ -627,8 +1057,15 @@ export function createDefaultToolRegistry() {
       name: "report_write",
       label: "Report Write",
       runner: "provider",
+      phase: "drafting",
+      cluster: "report",
       failurePolicy: "record",
-      execute: ({ evidenceNodes, toolSummaries }, { run }) => callRuntimeProvider(run, evidenceNodes, toolSummaries, "report")
+      execute: (input, { run }) => {
+        if (input.deepResearch) {
+          return writeDeepResearchReport({ run, ...input });
+        }
+        return callRuntimeProvider(run, input.evidenceNodes, input.toolSummaries, "report");
+      }
     })
     .register({
       name: "mcp.invoke",
@@ -651,6 +1088,439 @@ async function waitUntilRunnable(run) {
 }
 
 async function executeRun(run) {
+  return executeDeepResearchRun(run);
+}
+
+async function executeDeepResearchRun(run) {
+  try {
+    const registry = run.toolRegistry ?? createDefaultToolRegistry();
+    run.startedAt = now();
+    run.virtualElapsedMs = typeof run.virtualElapsedMs === "number" ? run.virtualElapsedMs : 0;
+    run.meta.status = "running";
+
+    addEvent(run, {
+      type: "run_started",
+      phase: "initializing",
+      message: "Deep research run 已创建，正在建立研究任务和可追溯节点图。",
+      graphEvent: {
+        type: "node_added",
+        node: {
+          id: "task-intent",
+          kind: "task_intent",
+          label: "深度研究任务",
+          summary: run.meta.question,
+          shortBody: run.meta.scope,
+          status: "running",
+          cluster: "intent",
+          salience: 1,
+          confidence: 0.96,
+          attributes: {
+            question: run.meta.question,
+            scope: run.meta.scope,
+            depth: run.meta.depth,
+            researchMode: run.meta.researchMode,
+            sourceBudget: String(run.meta.sourceBudget),
+            provider: `${run.meta.provider.protocol} / ${run.meta.provider.model}`
+          },
+          episodes: [{ id: "task-intent-episode", time: "00:00", title: "Run created", detail: "用户提交研究问题，runtime 进入计划阶段。" }]
+        }
+      }
+    });
+    await waitForRun(run, 650);
+    await waitUntilRunnable(run);
+
+    nodeEvent(run, "ontology", "正在生成 deep research ontology：计划、搜索、来源、证据、验证、案例、图表和报告。", {
+      id: "ontology-runtime",
+      kind: "ontology",
+      label: "深研过程本体",
+      summary: "定义 research_plan/search_query/source/evidence/claim/verification/example/visualization/section 的节点与关系。",
+      status: "observed",
+      cluster: "ontology",
+      parentId: "task-intent",
+      salience: 0.82,
+      confidence: 0.9,
+      attributes: {
+        nodeTypes: "research_plan, search_query, source, evidence, claim, counterclaim, verification, example, visualization, section",
+        edgeTypes: "queries, returns_source, extracts_evidence, supports, contradicts, verifies, illustrates, feeds_visual, becomes_section"
+      },
+      episodes: [{ id: "ontology-episode", time: "00:02", title: "Ontology created", detail: "把 CLI/Agent 风格的 plan-act-observe-verify-write loop 映射为图节点。" }]
+    });
+    edgeEvent(run, "ontology", "Ontology 从任务中抽取。", { id: "edge-task-ontology", from: "task-intent", to: "ontology-runtime", kind: "extracts", confidence: 0.9 });
+    clusterEvent(run, "ontology", "Ontology cluster 已形成。", "ontology");
+    await waitForRun(run, 700);
+    await waitUntilRunnable(run);
+
+    const plan = createResearchPlan({
+      question: run.meta.question,
+      scope: run.meta.scope,
+      sourceBudget: run.meta.sourceBudget
+    });
+    nodeEvent(run, "graph_build", "ResearchPlanner 已生成研究 brief、问题树、搜索分支和验证维度。", {
+      id: "research-plan",
+      kind: "research_plan",
+      label: "研究计划",
+      shortBody: plan.brief,
+      summary: plan.summary,
+      status: "observed",
+      cluster: "plan",
+      parentId: "ontology-runtime",
+      salience: 0.9,
+      confidence: 0.9,
+      attributes: {
+        questions: String(plan.researchQuestions.length),
+        queries: String(plan.searchQueries.length),
+        sourceBudget: String(plan.sourceBudget),
+        outline: plan.outline.join(" / ")
+      },
+      episodes: plan.researchQuestions.map((question, index) => ({
+        id: `research-question-${index + 1}`,
+        time: `00:0${index + 3}`,
+        title: `RQ${index + 1}`,
+        detail: question
+      }))
+    });
+    edgeEvent(run, "graph_build", "研究计划由 ontology 生成。", { id: "edge-ontology-plan", from: "ontology-runtime", to: "research-plan", kind: "extracts", confidence: 0.9 });
+    clusterEvent(run, "graph_build", "Plan cluster 已形成。", "plan");
+    await waitForRun(run, 850);
+    await waitUntilRunnable(run);
+
+    const queryNodes = plan.searchQueries.map((query, index) => ({
+      id: `query-${index + 1}`,
+      kind: "search_query",
+      label: `检索分支 ${index + 1}`,
+      shortBody: query,
+      summary: query,
+      status: "observed",
+      cluster: "search",
+      parentId: "research-plan",
+      salience: 0.72,
+      confidence: 0.84,
+      attributes: {
+        query,
+        branch: String(index + 1)
+      },
+      episodes: [{ id: `query-${index + 1}-episode`, time: `00:0${index + 6}`, title: "Search branch planned", detail: query }]
+    }));
+    for (const queryNode of queryNodes) {
+      nodeEvent(run, "graph_build", `搜索分支生成：${queryNode.shortBody}`, queryNode);
+      edgeEvent(run, "graph_build", "Research plan 发出检索 query。", { id: `edge-plan-${queryNode.id}`, from: "research-plan", to: queryNode.id, kind: "queries", confidence: 0.84 });
+    }
+    clusterEvent(run, "graph_build", "Search cluster 已形成。", "search");
+    await waitForRun(run, 700);
+    await waitUntilRunnable(run);
+
+    const searchResults = await Promise.all(queryNodes.map((queryNode) =>
+      runRegisteredTool(run, registry, "search", { query: queryNode.summary, queryId: queryNode.id })
+    ));
+    for (const result of searchResults) {
+      assertToolOk(result, "Search Branch");
+      edgeEvent(run, "graph_build", "Search tool 读取对应 query。", { id: `edge-${result.output.queryId}-${result.toolCall.id}`, from: result.output.queryId, to: result.toolCall.id, kind: "uses_tool", confidence: 0.8 });
+    }
+    const sourceCandidates = dedupeSearchSources(searchResults.map((result) => result.output), plan.sourceBudget);
+    if (sourceCandidates.length < 8) {
+      throw new Error(`Deep research requires at least 8 usable sources; got ${sourceCandidates.length}.`);
+    }
+    for (const source of sourceCandidates) {
+      nodeEvent(run, "graph_build", `来源候选已入图：${source.title}`, {
+        id: source.id,
+        kind: "source",
+        label: source.title.slice(0, 18),
+        shortBody: source.snippet.slice(0, 90),
+        summary: source.snippet,
+        status: "observed",
+        cluster: "sources",
+        parentId: source.queryId,
+        sourceRefs: [source.url],
+        salience: 0.52,
+        confidence: 0.74,
+        attributes: {
+          url: source.url,
+          sourceType: source.sourceType,
+          date: source.date,
+          query: source.query
+        },
+        episodes: [{ id: `${source.id}-episode`, time: "00:10", title: "Source discovered", detail: source.snippet.slice(0, 180) }]
+      });
+      edgeEvent(run, "graph_build", "Search query 返回来源。", { id: `edge-${source.queryId}-${source.id}`, from: source.queryId, to: source.id, kind: "returns_source", confidence: 0.78 });
+    }
+    clusterEvent(run, "graph_build", "Sources cluster 已形成。", "sources");
+    await waitForRun(run, 850);
+    await waitUntilRunnable(run);
+
+    const fetchResults = await Promise.all(sourceCandidates.map((source) =>
+      runRegisteredTool(run, registry, "fetch", { url: source.url, query: run.meta.question })
+    ));
+    const fetchedByUrl = {};
+    fetchResults.forEach((result, index) => {
+      const source = sourceCandidates[index];
+      edgeEvent(run, "graph_build", "Fetch tool 读取来源正文。", { id: `edge-${source.id}-${result.toolCall.id}`, from: source.id, to: result.toolCall.id, kind: "uses_tool", confidence: result.ok ? 0.76 : 0.38 });
+      if (result.ok) {
+        fetchedByUrl[source.url] = result.output.text ?? "";
+      } else {
+        nodeEvent(run, "graph_build", `来源读取失败但保留为 degraded source：${source.title}`, {
+          id: `${source.id}-degraded`,
+          kind: "source",
+          label: `${source.title.slice(0, 14)} 失败`,
+          shortBody: result.toolCall.error,
+          summary: `Fetch failed: ${result.toolCall.error}`,
+          status: "failed",
+          cluster: "sources",
+          parentId: source.id,
+          sourceRefs: [source.url],
+          salience: 0.72,
+          confidence: 0.28,
+          attributes: {
+            status: "degraded",
+            error: result.toolCall.error || "fetch failed"
+          }
+        });
+      }
+    });
+    await waitForRun(run, 900);
+    await waitUntilRunnable(run);
+
+    const rank = await runRegisteredTool(run, registry, "rank_source", { sources: sourceCandidates, fetchedByUrl });
+    assertToolOk(rank, "Rank Sources");
+    for (const source of rank.output.sources) {
+      nodeEvent(run, "evidence", `来源质量已评分：${source.title}`, {
+        id: source.id,
+        kind: "source",
+        label: source.title.slice(0, 18),
+        shortBody: `${source.sourceType} / quality ${source.qualityScore.toFixed(2)}`,
+        summary: source.snippet,
+        status: "observed",
+        cluster: "sources",
+        parentId: rank.toolCall.id,
+        sourceRefs: [source.url],
+        salience: 0.54,
+        confidence: source.qualityScore,
+        attributes: {
+          rank: String(source.rank),
+          quality: source.qualityScore.toFixed(2),
+          independence: source.independence,
+          sourceType: source.sourceType
+        }
+      }, "node_updated");
+      edgeEvent(run, "evidence", "Rank source 连接到来源节点。", { id: `edge-${rank.toolCall.id}-${source.id}`, from: rank.toolCall.id, to: source.id, kind: "observes", confidence: source.qualityScore });
+    }
+    await waitForRun(run, 700);
+    await waitUntilRunnable(run);
+
+    const extract = await runRegisteredTool(run, registry, "extract", {
+      question: run.meta.question,
+      rankedSources: rank.output.sources
+    });
+    assertToolOk(extract, "Extract Evidence");
+    const evidenceCards = usableEvidenceItems(extract.output.items);
+    if (evidenceCards.length < 8) {
+      throw new Error(`Evidence Extract produced ${evidenceCards.length} usable cards; expected at least 8.`);
+    }
+    const evidenceNodes = evidenceCards.map((evidence, index) => ({
+      id: evidence.id,
+      kind: "evidence",
+      label: evidence.title.slice(0, 18),
+      shortBody: evidence.quote.slice(0, 72),
+      summary: evidence.quote,
+      status: "observed",
+      cluster: "evidence",
+      parentId: evidence.sourceId,
+      salience: 0.58 + Math.min(0.18, index * 0.012),
+      confidence: evidence.confidence,
+      sourceRefs: evidence.url ? [evidence.url] : [evidence.source],
+      evidence,
+      attributes: {
+        claim: evidence.claim,
+        sourceType: evidence.sourceType,
+        confidence: evidence.confidence.toFixed(2),
+        supports: (evidence.supports ?? []).join(" / "),
+        contradicts: (evidence.contradicts ?? []).join(" / ") || "none"
+      },
+      episodes: [{ id: `${evidence.id}-episode`, time: `00:${String(18 + index).padStart(2, "0")}`, title: "Evidence captured", detail: evidence.quote.slice(0, 180) }]
+    }));
+    for (const evidenceNode of evidenceNodes) {
+      nodeEvent(run, "evidence", `Evidence card 已生成：${evidenceNode.label}`, evidenceNode);
+      edgeEvent(run, "evidence", "Source 抽取 evidence card。", { id: `edge-${evidenceNode.parentId}-${evidenceNode.id}`, from: evidenceNode.parentId, to: evidenceNode.id, kind: "extracts_evidence", confidence: evidenceNode.confidence });
+    }
+    clusterEvent(run, "evidence", "Evidence cluster 已形成。", "evidence");
+    await waitForRun(run, 900);
+    await waitUntilRunnable(run);
+
+    const verification = await runRegisteredTool(run, registry, "cross_check", { evidenceCards });
+    assertToolOk(verification, "Cross Check");
+    for (const claim of verification.output.claims) {
+      const claimNode = {
+        id: claim.id,
+        kind: "claim",
+        label: claim.claim.slice(0, 16),
+        shortBody: `${claim.status} / ${claim.supportCount} sources`,
+        summary: `${claim.claim}：${claim.status}，由 ${claim.supportCount} 个独立来源支持。`,
+        status: "synthesized",
+        cluster: "verification",
+        parentId: verification.toolCall.id,
+        evidenceIds: claim.evidenceIds,
+        sourceRefs: claim.evidenceIds,
+        salience: claim.status === "verified" ? 0.88 : 0.74,
+        confidence: claim.confidence,
+        attributes: {
+          status: claim.status,
+          supportCount: String(claim.supportCount),
+          confidence: claim.confidence.toFixed(2)
+        },
+        episodes: [{ id: `${claim.id}-verification`, time: "00:32", title: "Claim checked", detail: `${claim.status}: ${claim.claim}` }]
+      };
+      nodeEvent(run, "reasoning", `交叉验证生成 claim：${claim.claim}`, claimNode);
+      for (const evidenceId of claim.evidenceIds.slice(0, 4)) {
+        edgeEvent(run, "reasoning", "Evidence 支撑 claim。", { id: `edge-${evidenceId}-${claim.id}`, from: evidenceId, to: claim.id, kind: "supports", confidence: claim.confidence });
+      }
+      edgeEvent(run, "reasoning", "Cross-check tool 验证 claim。", { id: `edge-${verification.toolCall.id}-${claim.id}`, from: verification.toolCall.id, to: claim.id, kind: "verifies", confidence: claim.confidence });
+    }
+    for (const counterclaim of verification.output.contradictions) {
+      nodeEvent(run, "reasoning", `冲突信号保留：${counterclaim.claim}`, {
+        id: counterclaim.id,
+        kind: "counterclaim",
+        label: "冲突信号",
+        shortBody: counterclaim.claim,
+        summary: counterclaim.summary,
+        status: "synthesized",
+        cluster: "verification",
+        parentId: counterclaim.sourceEvidenceId,
+        sourceRefs: [counterclaim.sourceEvidenceId],
+        salience: 0.76,
+        confidence: 0.52,
+        attributes: {
+          sourceEvidenceId: counterclaim.sourceEvidenceId
+        }
+      });
+      edgeEvent(run, "reasoning", "Evidence 与 counterclaim 形成冲突边。", { id: `edge-${counterclaim.sourceEvidenceId}-${counterclaim.id}`, from: counterclaim.sourceEvidenceId, to: counterclaim.id, kind: "contradicts", confidence: 0.52 });
+    }
+    clusterEvent(run, "reasoning", "Verification cluster 已形成。", "verification");
+    await waitForRun(run, 900);
+    await waitUntilRunnable(run);
+
+    const cases = await runRegisteredTool(run, registry, "case_find", { claims: verification.output.claims });
+    assertToolOk(cases, "Find Cases");
+    for (const example of cases.output.examples) {
+      nodeEvent(run, "reasoning", `案例已补充：${example.title}`, {
+        id: example.id,
+        kind: "example",
+        label: example.title,
+        shortBody: example.body.slice(0, 72),
+        summary: example.body,
+        status: "observed",
+        cluster: "synthesis",
+        parentId: example.claimId,
+        sourceRefs: [example.claimId],
+        salience: 0.66,
+        confidence: 0.76,
+        attributes: {
+          claimId: example.claimId
+        }
+      });
+      edgeEvent(run, "reasoning", "Example 说明 claim。", { id: `edge-${example.claimId}-${example.id}`, from: example.claimId, to: example.id, kind: "illustrates", confidence: 0.74 });
+    }
+    clusterEvent(run, "reasoning", "Synthesis cluster 已形成。", "synthesis");
+    await waitForRun(run, 750);
+    await waitUntilRunnable(run);
+
+    const charts = await runRegisteredTool(run, registry, "chart_plan", {
+      claims: verification.output.claims,
+      sources: rank.output.sources
+    });
+    assertToolOk(charts, "Plan Charts");
+    const visualizationNodeIds = charts.output.blocks.map((block) => `visual-${block.id}`);
+    for (const block of charts.output.blocks) {
+      const nodeId = `visual-${block.id}`;
+      nodeEvent(run, "drafting", `可视化规格已生成：${block.title}`, {
+        id: nodeId,
+        kind: "visualization",
+        label: block.title.slice(0, 16),
+        shortBody: block.type,
+        summary: block.type === "mermaid" ? block.code : `${block.title} / ${block.type}`,
+        status: "written",
+        cluster: "visualization",
+        sourceRefs: block.sourceNodeIds ?? [],
+        salience: 0.82,
+        confidence: 0.82,
+        attributes: {
+          blockId: block.id,
+          blockType: block.type
+        }
+      });
+      for (const sourceNodeId of (block.sourceNodeIds ?? []).slice(0, 5)) {
+        edgeEvent(run, "drafting", "证据或结论进入可视化。", { id: `edge-${sourceNodeId}-${nodeId}`, from: sourceNodeId, to: nodeId, kind: "feeds_visual", confidence: 0.76 });
+      }
+    }
+    clusterEvent(run, "drafting", "Visualization cluster 已形成。", "visualization");
+    await waitForRun(run, 750);
+    await waitUntilRunnable(run);
+
+    const reportTool = await runRegisteredTool(run, registry, "report_write", {
+      deepResearch: true,
+      plan,
+      sources: rank.output.sources,
+      evidenceCards,
+      verification: verification.output,
+      examples: cases.output.examples,
+      visualizations: charts.output
+    });
+    assertToolOk(reportTool, "Report Write");
+    const report = reportTool.output.report;
+    for (const section of report.sections) {
+      await waitForRun(run, 360);
+      await waitUntilRunnable(run);
+      const sectionNode = {
+        id: section.id.replace("section-", "section-node-"),
+        kind: "section",
+        label: section.title.replace(/^.+?、/, "").slice(0, 16),
+        shortBody: section.body.slice(0, 86),
+        summary: section.body,
+        status: "written",
+        cluster: "report",
+        parentId: reportTool.toolCall.id,
+        sourceRefs: section.sourceNodeIds,
+        reportAnchorId: section.id,
+        salience: 0.8,
+        confidence: 0.84,
+        attributes: {
+          sourceNodes: section.sourceNodeIds.join(", "),
+          reportSection: section.id
+        },
+        episodes: [{ id: `${section.id}-write`, time: "00:42", title: "Section written", detail: "长报告章节已写入，并绑定来源、证据或验证节点。" }]
+      };
+      nodeEvent(run, "drafting", `长报告章节写入：${section.title}`, sectionNode);
+      edgeEvent(run, "drafting", "Section 映射回 report writer。", { id: `edge-report-${sectionNode.id}`, from: reportTool.toolCall.id, to: sectionNode.id, kind: "becomes_section", confidence: 0.86 });
+      for (const sourceNodeId of section.sourceNodeIds.slice(0, 4)) {
+        edgeEvent(run, "drafting", "Section 绑定来源图谱节点。", { id: `edge-${sourceNodeId}-${sectionNode.id}`, from: sourceNodeId, to: sectionNode.id, kind: "becomes_section", confidence: 0.78 });
+      }
+    }
+    for (const visualNodeId of visualizationNodeIds.slice(0, 4)) {
+      edgeEvent(run, "drafting", "Visualization block 写入最终报告。", { id: `edge-${visualNodeId}-${reportTool.toolCall.id}`, from: visualNodeId, to: reportTool.toolCall.id, kind: "feeds_visual", confidence: 0.8 });
+    }
+    clusterEvent(run, "final_reveal", "Report cluster 已形成，长报告可反向追溯。", "report");
+
+    await waitForRun(run, 500);
+    await waitUntilRunnable(run);
+    run.meta.status = "completed";
+    addEvent(run, {
+      type: "run_completed",
+      phase: "completed",
+      message: "Demo deep research run 已完成：报告包含来源矩阵、交叉验证、案例和结构图。",
+      finalReport: report
+    });
+    broadcast(run, "run-closed", { runId: run.meta.id });
+  } catch (error) {
+    if (run.meta.status === "cancelled") {
+      addEvent(run, { type: "run_cancelled", phase: run.events.at(-1)?.phase ?? "reasoning", message: "Run 已取消。" });
+    } else {
+      run.meta.status = "failed";
+      const errorMessage = error instanceof Error ? error.message : "Unknown error";
+      addEvent(run, { type: "run_failed", phase: run.events.at(-1)?.phase ?? "evidence", message: `Run 执行失败：${errorMessage}`, error: errorMessage });
+    }
+    broadcast(run, "run-closed", { runId: run.meta.id });
+  }
+}
+
+async function executeLegacyRun(run) {
   try {
     const registry = run.toolRegistry ?? createDefaultToolRegistry();
     run.startedAt = now();
@@ -947,13 +1817,16 @@ function createRun(body, options = {}) {
     ...(body.providerConfig ?? {}),
     apiKey: body.providerConfig?.apiKey || envProviderKey()
   });
-  const allowDemoFallback = options.allowDemoFallback ?? (process.env.LOADING_MIND_DEMO_MODE === "1");
+  const allowDemoFallback = options.allowDemoFallback ?? (process.env.LOADING_MIND_DEMO_MODE === "1" || !providerConfig.apiKey);
   const meta = {
     id: `run-${createdAt.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
     question: String(body.question || "AI Agent 长链路等待过程如何设计？"),
     scope: String(body.scope || "AI 调研报告过程可视化"),
     depth: body.depth === "fast" || body.depth === "deep" ? body.depth : "standard",
     sources: Array.isArray(body.sources) && body.sources.length > 0 ? body.sources.map(String) : ["web_search", "web_fetch", "document_read"],
+    researchMode: "demo_deep_research",
+    sourceBudget: clampSourceBudget(body.sourceBudget),
+    visualization: "auto",
     provider: providerPublicSummary(providerConfig),
     status: "queued",
     createdAt,

@@ -7,7 +7,7 @@ import { ForceNebulaGraph } from "./ForceNebulaGraph";
 import { computeSceneInsets } from "./graphPhysics";
 import { MindstreamCanvas } from "./MindstreamCanvas";
 import { useMindstream } from "./useMindstream";
-import type { GraphSceneSnapshot, LoadingPhase, ProviderConfig, ProviderProtocol, VisualMode } from "./types";
+import type { ArtifactBlock, GraphSceneSnapshot, LoadingPhase, ProviderConfig, ProviderProtocol, VisualMode } from "./types";
 
 const phaseCopy: Record<LoadingPhase, string> = {
   initializing: "任务 seed 正在建立",
@@ -48,6 +48,66 @@ const calibrationTopics = [
 function maskedProvider(provider: ProviderConfig) {
   const key = provider.apiKey.trim();
   return key ? `${key.slice(0, 6)}...${key.slice(-3)}` : "API key required";
+}
+
+function sourceLabel(sourceNodeIds: string[] = []) {
+  return sourceNodeIds.slice(0, 5).join(" / ");
+}
+
+function ReportBlock({
+  block,
+  onFocusSource
+}: {
+  block: ArtifactBlock;
+  onFocusSource: (nodeId: string | null) => void;
+}) {
+  const firstSource = block.sourceNodeIds?.[0] ?? null;
+  return (
+    <section className={`report-block block-${block.type}`}>
+      <button
+        className="report-block-focus"
+        type="button"
+        onClick={() => onFocusSource(firstSource)}
+        disabled={!firstSource}
+      >
+        {block.title ?? "Report block"}
+      </button>
+      {block.type === "markdown" && <p>{block.body}</p>}
+      {(block.type === "table" || block.type === "source_matrix") && (
+        <div className="report-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                {block.columns.map((column) => <th key={column}>{column}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {block.rows.map((row, index) => (
+                <tr key={`${block.id}-${index}`}>
+                  {block.columns.map((column) => <td key={column}>{String(row[column] ?? "")}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {block.type === "mermaid" && <pre className="mermaid-block">{block.code}</pre>}
+      {block.type === "claim_graph" && (
+        <div className="claim-graph-block">
+          <div>
+            <strong>{block.nodes.length}</strong>
+            <span>nodes</span>
+          </div>
+          <div>
+            <strong>{block.edges.length}</strong>
+            <span>edges</span>
+          </div>
+          <p>{block.nodes.slice(0, 5).map((node) => node.label).join(" / ")}</p>
+        </div>
+      )}
+      {block.sourceNodeIds && block.sourceNodeIds.length > 0 && <em>{sourceLabel(block.sourceNodeIds)}</em>}
+    </section>
+  );
 }
 
 export function App() {
@@ -438,6 +498,26 @@ export function App() {
             <span>FINAL REPORT</span>
             <h2>{finalArtifact.title}</h2>
             <p>{finalArtifact.body}</p>
+            {finalArtifact.sections && (
+              <nav className="report-toc" aria-label="Report table of contents">
+                {finalArtifact.sections.map((section) => (
+                  <button
+                    key={`toc-${section.id}`}
+                    type="button"
+                    onClick={() => setReportFocusNodeId(section.sourceNodeIds[0] ?? null)}
+                  >
+                    {section.title}
+                  </button>
+                ))}
+              </nav>
+            )}
+            {finalArtifact.blocks && (
+              <article className="report-blocks" aria-label="Structured report blocks">
+                {finalArtifact.blocks.map((block) => (
+                  <ReportBlock block={block} key={block.id} onFocusSource={setReportFocusNodeId} />
+                ))}
+              </article>
+            )}
             {finalArtifact.sections && (
               <article className="report-article" aria-label="Generated report article">
                 {finalArtifact.sections.map((section) => {

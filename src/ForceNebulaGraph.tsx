@@ -64,11 +64,18 @@ type NodeSnapshot = {
 const nodeKindLabel: Record<GraphNodeKind, string> = {
   task_intent: "TASK",
   ontology: "ONTOLOGY",
+  research_plan: "PLAN",
+  search_query: "QUERY",
+  source: "SOURCE",
   entity: "ENTITY",
   evidence: "EVIDENCE",
   tool_call: "TOOL",
   observation: "OBSERVATION",
   claim: "CLAIM",
+  counterclaim: "COUNTER",
+  verification: "VERIFY",
+  example: "EXAMPLE",
+  visualization: "VISUAL",
   section: "SECTION"
 };
 
@@ -82,7 +89,14 @@ const nodeTierLabel: Record<GraphNodeTier, string> = {
 
 const edgeKindLabel: Record<GraphEdgeKind, string> = {
   extracts: "extracts",
+  queries: "queries",
+  returns_source: "returns source",
+  extracts_evidence: "extracts evidence",
   supports: "supports",
+  contradicts: "contradicts",
+  verifies: "verifies",
+  illustrates: "illustrates",
+  feeds_visual: "feeds visual",
   observes: "observes",
   uses_tool: "uses tool",
   synthesizes: "synthesizes",
@@ -92,8 +106,14 @@ const edgeKindLabel: Record<GraphEdgeKind, string> = {
 const clusterColor: Record<GraphCluster, { fill: string; stroke: string }> = {
   intent: { fill: "rgba(217, 130, 43, 0.1)", stroke: "rgba(217, 130, 43, 0.2)" },
   ontology: { fill: "rgba(47, 43, 37, 0.07)", stroke: "rgba(47, 43, 37, 0.14)" },
+  plan: { fill: "rgba(47, 43, 37, 0.07)", stroke: "rgba(47, 43, 37, 0.16)" },
+  search: { fill: "rgba(243, 164, 59, 0.08)", stroke: "rgba(217, 130, 43, 0.18)" },
+  sources: { fill: "rgba(141, 199, 192, 0.1)", stroke: "rgba(62, 133, 129, 0.16)" },
   evidence: { fill: "rgba(141, 199, 192, 0.12)", stroke: "rgba(62, 133, 129, 0.18)" },
+  verification: { fill: "rgba(217, 130, 43, 0.08)", stroke: "rgba(217, 130, 43, 0.2)" },
+  synthesis: { fill: "rgba(47, 43, 37, 0.06)", stroke: "rgba(47, 43, 37, 0.14)" },
   reasoning: { fill: "rgba(243, 164, 59, 0.1)", stroke: "rgba(217, 130, 43, 0.22)" },
+  visualization: { fill: "rgba(141, 199, 192, 0.11)", stroke: "rgba(62, 133, 129, 0.2)" },
   report: { fill: "rgba(141, 199, 192, 0.1)", stroke: "rgba(62, 133, 129, 0.18)" }
 };
 

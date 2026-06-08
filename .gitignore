@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.codegraph/
+.playwright-cli/
+.agent-runs/
+.DS_Store
+npm-debug.log*

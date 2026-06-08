@@ -14,11 +14,27 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function runtimeElapsed(run) {
+  return typeof run.virtualElapsedMs === "number" ? run.virtualElapsedMs : now() - run.startedAt;
+}
+
+async function waitForRun(run, ms) {
+  const scale = typeof run.delayScale === "number" ? run.delayScale : 1;
+  if (scale <= 0) {
+    run.virtualElapsedMs = (run.virtualElapsedMs ?? runtimeElapsed(run)) + ms;
+    return;
+  }
+  await wait(Math.max(0, Math.round(ms * scale)));
+}
+
 function ensureStore() {
   fs.mkdirSync(dataDir, { recursive: true });
 }
 
 function persist(run) {
+  if (run.persistEvents === false) {
+    return;
+  }
   ensureStore();
   fs.writeFileSync(path.join(dataDir, `${run.meta.id}.json`), JSON.stringify({
     meta: run.meta,
@@ -43,7 +59,7 @@ function addEvent(run, event) {
     ...event,
     id: event.id ?? `${run.meta.id}-${run.events.length + 1}`,
     runId: run.meta.id,
-    elapsedMs: now() - run.startedAt
+    elapsedMs: runtimeElapsed(run)
   };
   run.events.push(nextEvent);
   run.meta.updatedAt = now();
@@ -157,6 +173,29 @@ function usableEvidenceItems(items) {
   return (items ?? []).filter((item) => item?.quote && item?.title && item?.source);
 }
 
+export class ToolRegistry {
+  constructor() {
+    this.tools = new Map();
+  }
+
+  register(spec) {
+    this.tools.set(spec.name, spec);
+    return this;
+  }
+
+  get(name) {
+    const tool = this.tools.get(name);
+    if (!tool) {
+      throw new Error(`Tool is not registered: ${name}`);
+    }
+    return tool;
+  }
+
+  list() {
+    return [...this.tools.values()].map(({ execute, ...tool }) => tool);
+  }
+}
+
 async function toolCall(run, toolName, input, label, executor, options = {}) {
   const failurePolicy = options.failurePolicy ?? "record";
   const startedAt = now();
@@ -193,20 +232,125 @@ async function toolCall(run, toolName, input, label, executor, options = {}) {
   }
 }
 
+async function runRegisteredTool(run, registry, toolName, input) {
+  const tool = registry.get(toolName);
+  return toolCall(run, toolName, input, tool.label, () => tool.execute(input, { run, registry }), {
+    failurePolicy: tool.failurePolicy
+  });
+}
+
+function demoSearchItems(query) {
+  return [
+    {
+      title: "Agent 过程可视化",
+      url: "demo://process-visibility",
+      text: `围绕“${query}”，可检查的 Agent 过程应展示任务意图、工具调用、证据、判断和报告映射，而不是只展示等待动画。`
+    },
+    {
+      title: "工具失败需要可感知",
+      url: "demo://tool-failure",
+      text: "失败工具应该保留 input、status、error 和 retry 线索；空结果不应被当作正常 observation。"
+    },
+    {
+      title: "报告必须绑定来源节点",
+      url: "demo://report-grounding",
+      text: "最终报告章节需要绑定 sourceNodeIds，用户才能从结论反查证据和工具观察。"
+    }
+  ];
+}
+
+function demoFetchedText(query) {
+  return [
+    `Demo sandbox observation for ${query}.`,
+    "A production Agent Process OS should turn long-running work into inspectable state transitions.",
+    "The runtime should expose tool calls, observations, evidence extraction, synthesis, and report writing as first-class graph events.",
+    "When external tools are unavailable, the demo should show an explicit fallback observation instead of pretending the tool succeeded silently."
+  ].join(" ");
+}
+
+function demoProviderResult(run, evidenceNodes, mode) {
+  const evidenceIds = evidenceNodes.map((node) => node.id);
+  if (mode === "analysis") {
+    return {
+      summary: `Demo provider analysis: “${run.meta.question}” 的关键是把等待过程变成可追溯的工作界面，并把失败工具显式暴露给用户。`,
+      sections: [
+        {
+          id: "section-analysis-process",
+          title: "过程可视化判断",
+          body: "当前证据足以支持一个 demo 级判断：用户需要看到 Agent 正在做什么、用了哪些工具、哪些观察支撑了最终判断。",
+          sourceNodeIds: ["task-intent", "ontology-runtime", ...evidenceIds.slice(0, 2)]
+        },
+        {
+          id: "section-analysis-risk",
+          title: "主要风险",
+          body: "主要风险是工具失败被静默吞掉，或最终报告与过程节点脱节。runtime 必须保留失败节点并阻止空证据继续合成正常报告。",
+          sourceNodeIds: [...evidenceIds.slice(0, 3), "claim-visible-process"]
+        }
+      ]
+    };
+  }
+
+  return {
+    summary: `Demo provider report: 本报告围绕“${run.meta.question}”生成，展示 Loading Mind 如何把长链路 Agent run 变成可检查、可追溯、可交互的过程资产。`,
+    sections: fallbackReportSections(run.meta.question, evidenceNodes, "claim-visible-process", {
+      search: "web_search-1",
+      fetch: "web_fetch-2",
+      documentRead: "document_read-3",
+      extract: "evidence_extract-4",
+      reportWrite: "report_write-6"
+    })
+  };
+}
+
+async function callRuntimeProvider(run, evidenceNodes, toolSummaries, mode) {
+  if (run.forceDemoTools || (run.allowDemoFallback && !run.providerConfig.apiKey)) {
+    return demoProviderResult(run, evidenceNodes, mode);
+  }
+  try {
+    return await callProvider(run.providerConfig, providerPrompt(run, evidenceNodes, toolSummaries, mode));
+  } catch (error) {
+    if (run.allowDemoFallback && !run.providerConfig.apiKey) {
+      return demoProviderResult(run, evidenceNodes, mode);
+    }
+    throw error;
+  }
+}
+
 async function searchWeb(query) {
+  if (query?.forceDemoTools) {
+    return {
+      summary: "Demo sandbox 使用内置搜索 observation，未访问外部搜索服务。",
+      items: demoSearchItems(query.query ?? "")
+    };
+  }
+
+  const searchQuery = typeof query === "string" ? query : query.query;
+  const allowDemoFallback = Boolean(typeof query === "object" && query.allowDemoFallback);
   const url = new URL("https://api.duckduckgo.com/");
-  url.searchParams.set("q", query);
+  url.searchParams.set("q", searchQuery);
   url.searchParams.set("format", "json");
   url.searchParams.set("no_redirect", "1");
   url.searchParams.set("no_html", "1");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
-  const response = await fetch(url, { signal: controller.signal });
-  clearTimeout(timer);
-  if (!response.ok) {
-    throw new Error(`Search HTTP ${response.status}`);
+  let data = null;
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!response.ok) {
+      throw new Error(`Search HTTP ${response.status}`);
+    }
+    data = await response.json();
+  } catch (error) {
+    clearTimeout(timer);
+    if (!allowDemoFallback) {
+      throw error;
+    }
+    return {
+      summary: `外部搜索不可达，Demo sandbox 使用内置 observation 继续。原因：${error instanceof Error ? error.message : "Unknown search failure"}`,
+      items: demoSearchItems(searchQuery)
+    };
   }
-  const data = await response.json();
   const topics = [];
   const collect = (items) => {
     for (const item of items ?? []) {
@@ -227,23 +371,47 @@ async function searchWeb(query) {
     });
   }
   return {
-    summary: topics.length > 0 ? `搜索返回 ${topics.length} 条候选来源。` : "搜索未返回强结果，进入本地过程假设补全。",
-    items: topics.slice(0, 4)
+    summary: topics.length > 0 ? `搜索返回 ${topics.length} 条候选来源。` : "搜索未返回强结果，Demo sandbox 使用内置 observation 补全。",
+    items: topics.length > 0 ? topics.slice(0, 4) : demoSearchItems(searchQuery)
   };
 }
 
-async function fetchPage(url) {
+async function fetchPage(url, options = {}) {
   if (!url) {
+    if (options.allowDemoFallback) {
+      return {
+        summary: "没有可抓取 URL，Demo sandbox 使用内置网页 observation。",
+        text: demoFetchedText(options.query ?? "runtime demo")
+      };
+    }
     throw new Error("No URL available for web_fetch");
+  }
+  if (options.forceDemoTools || String(url).startsWith("demo://")) {
+    return {
+      summary: "Demo sandbox 读取内置网页片段。",
+      text: demoFetchedText(options.query ?? url)
+    };
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 9000);
-  const response = await fetch(url, { signal: controller.signal });
-  clearTimeout(timer);
-  if (!response.ok) {
-    throw new Error(`Fetch HTTP ${response.status}`);
+  let html = "";
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!response.ok) {
+      throw new Error(`Fetch HTTP ${response.status}`);
+    }
+    html = await response.text();
+  } catch (error) {
+    clearTimeout(timer);
+    if (!options.allowDemoFallback) {
+      throw error;
+    }
+    return {
+      summary: `网页读取不可达，Demo sandbox 使用内置网页 observation。原因：${error instanceof Error ? error.message : "Unknown fetch failure"}`,
+      text: demoFetchedText(options.query ?? url)
+    };
   }
-  const html = await response.text();
   const text = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -404,9 +572,78 @@ function providerPrompt(run, evidenceNodes, toolSummaries, mode) {
   ];
 }
 
+export function createDefaultToolRegistry() {
+  return new ToolRegistry()
+    .register({
+      name: "web_search",
+      label: "Web Search",
+      runner: "http",
+      failurePolicy: "record",
+      execute: ({ query }, { run }) => searchWeb({
+        query,
+        allowDemoFallback: run.allowDemoFallback,
+        forceDemoTools: run.forceDemoTools
+      })
+    })
+    .register({
+      name: "web_fetch",
+      label: "Web Fetch",
+      runner: "http",
+      failurePolicy: "record",
+      execute: ({ url, query }, { run }) => fetchPage(url, {
+        query,
+        allowDemoFallback: run.allowDemoFallback,
+        forceDemoTools: run.forceDemoTools
+      })
+    })
+    .register({
+      name: "document_read",
+      label: "Document Read",
+      runner: "local",
+      failurePolicy: "record",
+      execute: ({ question, scope }) => ({
+        summary: "读取用户输入的任务范围和约束，作为本次调研的内部文档来源。",
+        text: `${question}\n${scope}`
+      })
+    })
+    .register({
+      name: "evidence_extract",
+      label: "Evidence Extract",
+      runner: "local",
+      failurePolicy: "record",
+      execute: ({ question, searchItems, fetchedText, documentText }) => ({
+        summary: "从搜索和网页读取结果中抽取证据片段。",
+        items: localEvidence(question, searchItems ?? [], fetchedText ?? "", documentText ?? "")
+      })
+    })
+    .register({
+      name: "llm_analyze",
+      label: "LLM Analyze",
+      runner: "provider",
+      failurePolicy: "record",
+      execute: ({ evidenceNodes, toolSummaries }, { run }) => callRuntimeProvider(run, evidenceNodes, toolSummaries, "analysis")
+    })
+    .register({
+      name: "report_write",
+      label: "Report Write",
+      runner: "provider",
+      failurePolicy: "record",
+      execute: ({ evidenceNodes, toolSummaries }, { run }) => callRuntimeProvider(run, evidenceNodes, toolSummaries, "report")
+    })
+    .register({
+      name: "mcp.invoke",
+      label: "MCP Tool",
+      runner: "mcp",
+      failurePolicy: "record",
+      execute: () => {
+        throw new Error("MCP adapter is not configured for this demo runtime yet.");
+      }
+    });
+}
+
 async function waitUntilRunnable(run) {
   while (run.meta.status === "paused") {
-    await wait(180);
+    await waitForRun(run, 180);
   }
   if (run.meta.status === "cancelled") {
     throw new Error("Run cancelled");
@@ -415,7 +652,9 @@ async function waitUntilRunnable(run) {
 
 async function executeRun(run) {
   try {
+    const registry = run.toolRegistry ?? createDefaultToolRegistry();
     run.startedAt = now();
+    run.virtualElapsedMs = typeof run.virtualElapsedMs === "number" ? run.virtualElapsedMs : 0;
     run.meta.status = "running";
     addEvent(run, {
       type: "run_started",
@@ -445,7 +684,7 @@ async function executeRun(run) {
         }
       }
     });
-    await wait(900);
+    await waitForRun(run, 900);
     await waitUntilRunnable(run);
 
     nodeEvent(run, "ontology", "正在生成 ontology：实体、证据、工具和报告章节类型。", {
@@ -466,17 +705,17 @@ async function executeRun(run) {
     });
     edgeEvent(run, "ontology", "Ontology 与 task_intent 连接。", { id: "edge-task-ontology", from: "task-intent", to: "ontology-runtime", kind: "extracts", confidence: 0.9 });
     clusterEvent(run, "ontology", "Ontology cluster 已形成。", "ontology");
-    await wait(1000);
+    await waitForRun(run, 1000);
     await waitUntilRunnable(run);
 
-    const search = await toolCall(run, "web_search", { query: run.meta.question }, "Web Search", () => searchWeb(run.meta.question));
+    const search = await runRegisteredTool(run, registry, "web_search", { query: run.meta.question });
     edgeEvent(run, "evidence", "Search tool 与 ontology 连接。", { id: "edge-ontology-search", from: "ontology-runtime", to: search.toolCall.id, kind: "uses_tool", confidence: 0.82 });
     assertToolOk(search, "Web Search");
-    await wait(700);
+    await waitForRun(run, 700);
     await waitUntilRunnable(run);
 
     const firstUrl = search.output.items?.[0]?.url;
-    const fetched = await toolCall(run, "web_fetch", { url: firstUrl || "fallback" }, "Web Fetch", () => fetchPage(firstUrl));
+    const fetched = await runRegisteredTool(run, registry, "web_fetch", { url: firstUrl || "fallback", query: run.meta.question });
     edgeEvent(run, "evidence", "Fetch tool 读取搜索来源。", { id: "edge-search-fetch", from: search.toolCall.id, to: fetched.toolCall.id, kind: "uses_tool", confidence: 0.78 });
     const fetchPolicy = classifyWebFetchFailure(search, fetched);
     if (fetchPolicy.action === "fail") {
@@ -511,26 +750,26 @@ async function executeRun(run) {
       nodeEvent(run, "evidence", "Web Fetch 失败，但已记录降级 observation 并继续使用搜索结果。", degradedNode);
       edgeEvent(run, "evidence", "Fetch 失败状态连接到降级 observation。", { id: `edge-${fetched.toolCall.id}-degraded`, from: fetched.toolCall.id, to: degradedNode.id, kind: "observes", confidence: 0.58 });
     }
-    await wait(700);
+    await waitForRun(run, 700);
     await waitUntilRunnable(run);
 
-    const documentRead = await toolCall(run, "document_read", { scope: run.meta.scope }, "Document Read", async () => ({
-      summary: "读取用户输入的任务范围和约束，作为本次调研的内部文档来源。",
-      text: `${run.meta.question}\n${run.meta.scope}`
-    }));
+    const documentRead = await runRegisteredTool(run, registry, "document_read", { question: run.meta.question, scope: run.meta.scope });
     edgeEvent(run, "evidence", "Document reader 读取用户约束。", { id: "edge-task-document", from: "task-intent", to: documentRead.toolCall.id, kind: "uses_tool", confidence: 0.88 });
-    await wait(700);
+    await waitForRun(run, 700);
     await waitUntilRunnable(run);
 
-    const extract = await toolCall(run, "evidence_extract", { maxEvidence: 5 }, "Evidence Extract", async () => ({
-      summary: "从搜索和网页读取结果中抽取证据片段。",
-      items: localEvidence(run.meta.question, search.output.items ?? [], fetched.output.text ?? "", documentRead.output.text ?? "")
-    }));
+    const extract = await runRegisteredTool(run, registry, "evidence_extract", {
+      maxEvidence: 5,
+      question: run.meta.question,
+      searchItems: search.output.items ?? [],
+      fetchedText: fetched.output.text ?? "",
+      documentText: documentRead.output.text ?? ""
+    });
     edgeEvent(run, "evidence", "Evidence extract 汇总工具 observation。", { id: "edge-fetch-extract", from: fetched.toolCall.id, to: extract.toolCall.id, kind: "observes", confidence: 0.86 });
     edgeEvent(run, "evidence", "Evidence extract 读取 document observation。", { id: "edge-document-extract", from: documentRead.toolCall.id, to: extract.toolCall.id, kind: "observes", confidence: 0.84 });
     assertToolOk(extract, "Evidence Extract");
     clusterEvent(run, "evidence", "Evidence cluster 已形成。", "evidence");
-    await wait(900);
+    await waitForRun(run, 900);
 
     const extractedEvidence = usableEvidenceItems(extract.output.items);
     if (extractedEvidence.length === 0) {
@@ -558,13 +797,13 @@ async function executeRun(run) {
       episodes: [{ id: `${evidence.id}-episode`, time: `00:${String(10 + index).padStart(2, "0")}`, title: "Evidence captured", detail: evidence.quote.slice(0, 160) }]
     }));
     for (const evidenceNode of evidenceNodes) {
-      await wait(420);
+      await waitForRun(run, 420);
       await waitUntilRunnable(run);
       nodeEvent(run, "evidence", `证据节点已生成：${evidenceNode.label}`, evidenceNode);
       edgeEvent(run, "evidence", "Evidence 支撑后续 claim。", { id: `edge-extract-${evidenceNode.id}`, from: extract.toolCall.id, to: evidenceNode.id, kind: "observes", confidence: evidenceNode.confidence });
     }
 
-    await wait(700);
+    await waitForRun(run, 700);
     await waitUntilRunnable(run);
     const toolSummaries = [
       search.toolCall,
@@ -578,21 +817,16 @@ async function executeRun(run) {
       outputSummary: tool.outputSummary,
       costMs: tool.costMs
     }));
-    const llmAnalysis = await toolCall(
-      run,
-      "llm_analyze",
-      {
-        protocol: run.meta.provider?.protocol || "openai",
-        model: run.meta.provider?.model || "mimo-v2.5-pro",
-        evidenceNodes: evidenceNodes.length
-      },
-      "LLM Analyze",
-      () => callProvider(run.providerConfig, providerPrompt(run, evidenceNodes, toolSummaries, "analysis"))
-    );
+    const llmAnalysis = await runRegisteredTool(run, registry, "llm_analyze", {
+      protocol: run.meta.provider?.protocol || "openai",
+      model: run.meta.provider?.model || "mimo-v2.5-pro",
+      evidenceNodes,
+      toolSummaries
+    });
     edgeEvent(run, "reasoning", "LLM Analyze 读取 evidence extract 的 observation。", { id: "edge-extract-llm-analyze", from: extract.toolCall.id, to: llmAnalysis.toolCall.id, kind: "observes", confidence: 0.88 });
     assertToolOk(llmAnalysis, "LLM Analyze");
 
-    await wait(700);
+    await waitForRun(run, 700);
     await waitUntilRunnable(run);
     const claimNode = {
       id: "claim-visible-process",
@@ -623,26 +857,22 @@ async function executeRun(run) {
     }
     clusterEvent(run, "reasoning", "Reasoning cluster 已形成。", "reasoning");
 
-    await wait(900);
+    await waitForRun(run, 900);
     await waitUntilRunnable(run);
-    const reportTool = await toolCall(
-      run,
-      "report_write",
-      {
-        protocol: run.meta.provider?.protocol || "openai",
-        model: run.meta.provider?.model || "mimo-v2.5-pro",
-        sections: 4,
-        sourceNodeIds: evidenceNodes.length
-      },
-      "Report Write",
-      () => callProvider(run.providerConfig, providerPrompt(run, evidenceNodes, [...toolSummaries, {
+    const reportTool = await runRegisteredTool(run, registry, "report_write", {
+      protocol: run.meta.provider?.protocol || "openai",
+      model: run.meta.provider?.model || "mimo-v2.5-pro",
+      sections: 4,
+      sourceNodeIds: evidenceNodes.length,
+      evidenceNodes,
+      toolSummaries: [...toolSummaries, {
         id: llmAnalysis.toolCall.id,
         toolName: llmAnalysis.toolCall.toolName,
         status: llmAnalysis.toolCall.status,
         outputSummary: llmAnalysis.output.summary,
         costMs: llmAnalysis.toolCall.costMs
-      }], "report"))
-    );
+      }]
+    });
     edgeEvent(run, "drafting", "Report writer 使用 claim 生成章节。", { id: "edge-claim-report-tool", from: claimNode.id, to: reportTool.toolCall.id, kind: "uses_tool", confidence: 0.9 });
     edgeEvent(run, "drafting", "Report writer 复用 LLM Analyze observation。", { id: "edge-analysis-report-tool", from: llmAnalysis.toolCall.id, to: reportTool.toolCall.id, kind: "observes", confidence: 0.88 });
     assertToolOk(reportTool, "Report Write");
@@ -656,7 +886,7 @@ async function executeRun(run) {
       reportWrite: reportTool.toolCall.id
     }, reportTool.output);
     for (const section of report.sections) {
-      await wait(650);
+      await waitForRun(run, 650);
       await waitUntilRunnable(run);
       const sectionNode = {
         id: section.id.replace("section-", "section-node-"),
@@ -682,7 +912,7 @@ async function executeRun(run) {
     }
     clusterEvent(run, "final_reveal", "Report cluster 已形成，章节与来源图谱完成映射。", "report");
 
-    await wait(600);
+    await waitForRun(run, 600);
     await waitUntilRunnable(run);
     run.meta.status = "completed";
     addEvent(run, {
@@ -704,9 +934,20 @@ async function executeRun(run) {
   }
 }
 
-function createRun(body) {
+function envProviderKey() {
+  return process.env.LOADING_MIND_PROVIDER_API_KEY
+    || process.env.MIMO_API_KEY
+    || process.env.OPENAI_API_KEY
+    || "";
+}
+
+function createRun(body, options = {}) {
   const createdAt = now();
-  const providerConfig = sanitizeProviderConfig(body.providerConfig ?? {});
+  const providerConfig = sanitizeProviderConfig({
+    ...(body.providerConfig ?? {}),
+    apiKey: body.providerConfig?.apiKey || envProviderKey()
+  });
+  const allowDemoFallback = options.allowDemoFallback ?? (process.env.LOADING_MIND_DEMO_MODE === "1");
   const meta = {
     id: `run-${createdAt.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
     question: String(body.question || "AI Agent 长链路等待过程如何设计？"),
@@ -724,13 +965,37 @@ function createRun(body) {
     clients: new Set(),
     excludedEvidenceIds: new Set(),
     startedAt: createdAt,
+    virtualElapsedMs: 0,
     toolIndex: 0,
-    providerConfig
+    providerConfig,
+    persistEvents: options.persistEvents ?? true,
+    delayScale: options.delayScale ?? 1,
+    allowDemoFallback,
+    forceDemoTools: options.forceDemoTools ?? false,
+    toolRegistry: options.toolRegistry ?? createDefaultToolRegistry()
   };
   runStore.set(meta.id, run);
   persist(run);
-  setTimeout(() => executeRun(run), 300);
+  if (options.autoStart !== false) {
+    setTimeout(() => executeRun(run), 300);
+  }
   return run;
+}
+
+export async function createRunSnapshot(body, options = {}) {
+  const run = createRun(body, {
+    autoStart: false,
+    persistEvents: false,
+    delayScale: 0,
+    allowDemoFallback: true,
+    forceDemoTools: options.forceDemoTools ?? false,
+    ...options
+  });
+  await executeRun(run);
+  return {
+    run: run.meta,
+    events: run.events
+  };
 }
 
 function readPersistedRun(id) {

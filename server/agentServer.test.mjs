@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   assertToolOk,
   classifyWebFetchFailure,
+  createDefaultToolRegistry,
+  createRunSnapshot,
   hasUsableSearchObservation
 } from "./agentServer.mjs";
 
@@ -63,5 +65,38 @@ describe("agent runtime failure helpers", () => {
 
     expect(policy.action).toBe("fail");
     expect(policy.message).toContain("no usable Web Search observation");
+  });
+
+  it("runs a Vercel-compatible snapshot with demo tools and no provider key", async () => {
+    const snapshot = await createRunSnapshot({
+      question: "How should a visible agent process demo work?",
+      scope: "Vercel public demo",
+      depth: "standard",
+      sources: ["web_search", "web_fetch", "document_read"],
+      providerConfig: {
+        protocol: "openai",
+        baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+        anthropicBaseUrl: "https://token-plan-cn.xiaomimimo.com/anthropic",
+        apiKey: "",
+        model: "mimo-v2.5-pro",
+        temperature: 0.35,
+        maxTokens: 1408
+      }
+    }, {
+      forceDemoTools: true
+    });
+
+    expect(snapshot.run.status).toBe("completed");
+    expect(snapshot.events.some((event) => event.type === "run_completed")).toBe(true);
+    expect(snapshot.events.find((event) => event.finalReport)?.finalReport?.sections?.length).toBeGreaterThan(3);
+    expect(snapshot.events.some((event) => event.graphEvent?.type === "node_added")).toBe(true);
+  });
+
+  it("exposes registered tool runner metadata including the MCP adapter slot", () => {
+    const registry = createDefaultToolRegistry();
+    const tools = registry.list();
+
+    expect(tools.map((tool) => tool.name)).toContain("web_search");
+    expect(tools.find((tool) => tool.name === "mcp.invoke")?.runner).toBe("mcp");
   });
 });

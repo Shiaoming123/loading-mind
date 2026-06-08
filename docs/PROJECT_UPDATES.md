@@ -42,6 +42,12 @@ For visual or interaction changes, also check the app manually in a browser at d
 - Normal reports must not be generated from failed tools that produced no usable observations.
 - New runtime rules should have helper tests or reducer tests.
 
+## Deployment Change Policy
+
+- Vercel-facing API changes should keep `POST /api/runs` serverless-compatible: no required long-lived memory, background workers, or persistent SSE connection.
+- If snapshot delivery changes, update the frontend replay path, `README.md`, and a runtime smoke test together.
+- Tool orchestration changes should keep registered runner metadata visible through diagnostics so HTTP, local, provider, and future MCP adapters can be inspected.
+
 ## UI Change Policy
 
 - The canvas is the primary product surface. Center readouts, panels, and controls must not obscure core process nodes at common desktop widths.

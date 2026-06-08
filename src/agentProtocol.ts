@@ -10,6 +10,8 @@ export type CreateRunRequest = {
 
 export type CreateRunResponse = {
   run: AgentRun;
+  events?: AgentEvent[];
+  delivery?: "sse" | "snapshot";
 };
 
 export function agentEventToLoadingEvent(event: AgentEvent): LoadingEvent {

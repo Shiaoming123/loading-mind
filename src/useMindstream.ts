@@ -46,6 +46,7 @@ export function useMindstream() {
   const [state, dispatch] = useReducer(mindstreamReducer, initialState);
   const eventSourceRef = useRef<EventSource | null>(null);
   const fallbackTimerRef = useRef<number | null>(null);
+  const replayTimerRefs = useRef<number[]>([]);
   const fallbackRunRef = useRef<AgentRun | null>(null);
 
   const closeEventSource = useCallback(() => {
@@ -58,6 +59,10 @@ export function useMindstream() {
       window.clearInterval(fallbackTimerRef.current);
       fallbackTimerRef.current = null;
     }
+    for (const timer of replayTimerRefs.current) {
+      window.clearTimeout(timer);
+    }
+    replayTimerRefs.current = [];
     fallbackRunRef.current = null;
   }, []);
 
@@ -86,6 +91,25 @@ export function useMindstream() {
           clearFallback();
         }
       }, 80);
+    },
+    [clearFallback, closeEventSource]
+  );
+
+  const replayServerEvents = useCallback(
+    (run: AgentRun, events: AgentEvent[]) => {
+      closeEventSource();
+      clearFallback();
+      dispatch({ type: "START", run: { ...run, status: "running" } });
+
+      const sortedEvents = [...events].sort((left, right) => left.elapsedMs - right.elapsedMs);
+      const maxElapsed = Math.max(...sortedEvents.map((event) => event.elapsedMs), 1);
+      const scale = maxElapsed > 18000 ? 18000 / maxElapsed : 1;
+      replayTimerRefs.current = sortedEvents.map((event) =>
+        window.setTimeout(() => {
+          dispatch({ type: "TICK", elapsed: event.elapsedMs });
+          dispatch({ type: "APPLY_AGENT_EVENT", event });
+        }, Math.max(0, event.elapsedMs * scale))
+      );
     },
     [clearFallback, closeEventSource]
   );
@@ -133,13 +157,17 @@ export function useMindstream() {
         }
 
         const payload = (await response.json()) as CreateRunResponse;
-        dispatch({ type: "START", run: payload.run });
-        subscribeToRun(payload.run, request);
+        if (payload.events?.length) {
+          replayServerEvents(payload.run, payload.events);
+        } else {
+          dispatch({ type: "START", run: payload.run });
+          subscribeToRun(payload.run, request);
+        }
       } catch {
         startRecordedFallback(request);
       }
     },
-    [clearFallback, closeEventSource, startRecordedFallback, subscribeToRun]
+    [clearFallback, closeEventSource, replayServerEvents, startRecordedFallback, subscribeToRun]
   );
 
   const commandRun = useCallback(

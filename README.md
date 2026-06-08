@@ -44,6 +44,23 @@ The Vite dev server also mounts the local runtime API:
 
 Recorded run events are persisted under `.agent-runs/` and ignored by git.
 
+## Vercel Demo Deployment
+
+The app can run as a public Vercel demo without long-lived server memory. In production, `POST /api/runs` returns a completed run snapshot with replayable events, and the frontend replays those events locally. This keeps the demo compatible with serverless functions while preserving the visible Agent process.
+
+Vercel endpoints:
+
+- `POST /api/runs` creates and completes a serverless snapshot run.
+- `GET /api/diagnostics` reports delivery mode, registered tool runners, and basic network probes.
+
+Useful environment variables:
+
+- `LOADING_MIND_PROVIDER_API_KEY`, `MIMO_API_KEY`, or `OPENAI_API_KEY` supplies the provider key server-side.
+- `LOADING_MIND_DEMO_MODE=1` allows demo fallback observations when external tools are unavailable.
+- `LOADING_MIND_FORCE_DEMO_TOOLS=1` forces built-in demo tool outputs for public trial stability.
+
+Local development still uses the Vite middleware and SSE runtime so pause, resume, cancel, retry, and exclude interactions remain available while iterating.
+
 ## Demo Script
 
 1. Enter a real research question and start the run.

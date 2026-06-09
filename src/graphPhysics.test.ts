@@ -178,6 +178,27 @@ describe("graphPhysics", () => {
     expect(written.stroke).not.toBe(observed.stroke);
   });
 
+  it("dims low-importance failed tool labels until focused", () => {
+    const failed = nodeRenderToken({
+      id: "fetch-failed",
+      kind: "tool_call",
+      label: "Fetch failed",
+      status: "failed",
+      importance: 0.34
+    });
+    const focused = nodeRenderToken({
+      id: "fetch-failed",
+      kind: "tool_call",
+      label: "Fetch failed",
+      status: "failed",
+      importance: 0.34
+    }, true);
+
+    expect(failed.warningRing).toBe(true);
+    expect(failed.forceLabel).toBe(false);
+    expect(focused.forceLabel).toBe(true);
+  });
+
   it("keeps idle node glow much quieter than active or failed nodes", () => {
     const idle = nodeRenderToken({ id: "source", kind: "source", label: "Source", status: "observed" });
     const active = nodeRenderToken({ id: "source", kind: "source", label: "Source", status: "observed" }, true);
@@ -200,6 +221,18 @@ describe("graphPhysics", () => {
     expect(visibleEdges[0].relationCount).toBe(2);
     expect(visibleEdges[0].relationKinds.sort()).toEqual(["extracts", "supports"]);
     expect(visibleEdges[0].kind).toBe("supports");
+  });
+
+  it("keeps execution flow edges above semantic edges when aggregating", () => {
+    const edges = [
+      normalizeEdge({ id: "semantic", from: "research-plan", to: "search-summary", kind: "queries" }),
+      normalizeEdge({ id: "flow", from: "research-plan", to: "search-summary", kind: "execution_flow" })
+    ];
+
+    const visibleEdges = aggregateVisibleEdges(edges);
+
+    expect(visibleEdges).toHaveLength(1);
+    expect(visibleEdges[0].kind).toBe("execution_flow");
   });
 
   it("maps final report sections back to existing graph nodes", () => {

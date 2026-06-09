@@ -13,12 +13,14 @@ export const initialState: MindstreamState = {
   formedClusters: [],
   emphasizedNodeId: null,
   finalReport: null,
+  errorLogs: [],
   excludedEvidenceIds: [],
   error: null
 };
 
 export type MindstreamAction =
   | { type: "START"; run: AgentRun }
+  | { type: "RESET" }
   | { type: "PAUSE" }
   | { type: "RESUME" }
   | { type: "REPLAY" }
@@ -111,6 +113,8 @@ export function mindstreamReducer(
   action: MindstreamAction
 ): MindstreamState {
   switch (action.type) {
+    case "RESET":
+      return initialState;
     case "START":
       return {
         ...initialState,
@@ -197,6 +201,9 @@ export function mindstreamReducer(
         formedClusters: graphState.formedClusters,
         emphasizedNodeId: graphState.emphasizedNodeId,
         finalReport: action.event.finalReport ?? state.finalReport,
+        errorLogs: action.event.errorLog && !state.errorLogs.some((log) => log.createdAt === action.event.errorLog?.createdAt)
+          ? [...state.errorLogs, action.event.errorLog]
+          : state.errorLogs,
         error: action.event.type === "run_failed" ? action.event.error ?? action.event.message : state.error
       };
     }

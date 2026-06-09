@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-06-09 - Reliable Report Runs and Failure Diagnostics
+
+- Added structured run error logs with redacted tool input summaries, retryability, and next-action guidance.
+- Added failure reports so failed runs still render a readable report drawer instead of leaving users with a bare 500 or empty preview.
+- Added final report artifact validation and normalization before `run_completed`.
+- Added Live search fallback from Tavily to Brave Search to Firecrawl Search, plus Firecrawl scrape fallback for source content.
+- Added a read-only MCP allowlist adapter for `tavily.search`, `firecrawl.search`, `firecrawl.scrape`, and `exa.search`.
+- Added provider diagnostics metadata for Tavily, Brave, Firecrawl, Exa, LLM provider, and MCP allowlist status.
+- Added local form fields for optional Brave, Firecrawl, and Exa keys.
+
 ## 2026-06-08 - First Public Version
 
 - Added explicit Demo and Live run modes. Live mode uses Tavily search when `TAVILY_API_KEY` is configured and no longer silently replays demo fallbacks when real tools fail.

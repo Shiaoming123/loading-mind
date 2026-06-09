@@ -156,7 +156,17 @@ export function useMindstream() {
         });
 
         if (!response.ok) {
-          throw new Error(`Run service returned ${response.status}`);
+          const text = await response.text();
+          let message = `Run service returned ${response.status}`;
+          if (text) {
+            try {
+              const payload = JSON.parse(text) as { error?: string; message?: string };
+              message = payload.error || payload.message || message;
+            } catch {
+              message = text;
+            }
+          }
+          throw new Error(message);
         }
 
         const payload = (await response.json()) as CreateRunResponse;
@@ -252,6 +262,16 @@ export function useMindstream() {
     [state.run]
   );
 
+  const reset = useCallback(() => {
+    const runId = state.run?.id;
+    closeEventSource();
+    clearFallback();
+    if (runId && (state.status === "running" || state.status === "queued" || state.status === "paused")) {
+      fetch(`/api/runs/${runId}/cancel`, { method: "POST" }).catch(() => undefined);
+    }
+    dispatch({ type: "RESET" });
+  }, [clearFallback, closeEventSource, state.run?.id, state.status]);
+
   useEffect(() => () => {
     closeEventSource();
     clearFallback();
@@ -264,6 +284,7 @@ export function useMindstream() {
     resume: () => commandRun("resume"),
     cancel: () => commandRun("cancel"),
     replay,
+    reset,
     retryTool,
     excludeEvidence
   };

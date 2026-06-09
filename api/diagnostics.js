@@ -1,4 +1,4 @@
-import { createDefaultToolRegistry } from "../server/agentServer.mjs";
+import { createDiagnosticsSnapshot } from "../server/agentServer.mjs";
 
 export const config = {
   maxDuration: 10
@@ -31,27 +31,25 @@ export default async function handler(req, res) {
     return;
   }
 
-  const registry = createDefaultToolRegistry();
-  const [searchProbe, providerProbe] = await Promise.all([
+  const snapshot = createDiagnosticsSnapshot();
+  const [duckDuckGoProbe, providerProbe, braveProbe, firecrawlProbe] = await Promise.all([
     probe("https://api.duckduckgo.com/?q=loading%20mind&format=json&no_redirect=1&no_html=1"),
-    probe("https://token-plan-cn.xiaomimimo.com/v1/models")
+    probe("https://token-plan-cn.xiaomimimo.com/v1/models"),
+    probe("https://api.search.brave.com/res/v1/web/search?q=loading%20mind&count=1"),
+    probe("https://api.firecrawl.dev/v2/search")
   ]);
 
   res.status(200).json({
+    ...snapshot,
     runtime: "loading-mind-vercel",
     delivery: "snapshot",
     demoFallback: true,
-    orchestration: {
-      mode: "demo_deep_research",
-      sourceBudget: 12,
-      snapshotMode: true,
-      fallbackMode: process.env.LOADING_MIND_FORCE_DEMO_TOOLS === "1" ? "forced_demo_tools" : "demo_fallback_allowed",
-      mcpAdapterAvailable: registry.list().some((tool) => tool.name === "mcp.invoke")
-    },
-    tools: registry.list(),
+    orchestration: { ...snapshot.orchestration, snapshotMode: true },
     network: {
-      webSearch: searchProbe,
-      provider: providerProbe
+      duckDuckGo: duckDuckGoProbe,
+      provider: providerProbe,
+      brave: braveProbe,
+      firecrawl: firecrawlProbe
     }
   });
 }

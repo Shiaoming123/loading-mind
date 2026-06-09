@@ -84,6 +84,7 @@ const clusterIndex: Record<GraphCluster, number> = {
 };
 
 const edgePriority: Record<GraphEdgeKind, number> = {
+  execution_flow: 7,
   becomes_section: 6,
   feeds_visual: 6,
   verifies: 6,
@@ -137,6 +138,9 @@ export function deriveNodeImportance(node: GraphNode) {
   if (typeof node.importance === "number") {
     return node.importance;
   }
+  if (node.executionStep) {
+    return node.executionStep.stepStatus === "degraded" ? 0.74 : 0.86;
+  }
 
   switch (deriveNodeTier(node)) {
     case "core":
@@ -174,6 +178,7 @@ export function effectiveNodeStatus(node: GraphNode): EffectiveNodeStatus {
 export function nodeRenderToken(node: GraphNode, active = false): NodeRenderToken {
   const status = effectiveNodeStatus(node);
   const tier = deriveNodeTier(node);
+  const importance = deriveNodeImportance(node);
   const base =
     tier === "core"
       ? { fill: "#f3a43b", stroke: "rgba(116, 67, 16, 0.78)", halo: "243, 164, 59", label: "#8a4e14" }
@@ -195,7 +200,7 @@ export function nodeRenderToken(node: GraphNode, active = false): NodeRenderToke
       haloScale: 2.35,
       pulseStrength: 0.14,
       warningRing: true,
-      forceLabel: true
+      forceLabel: active || importance > 0.55
     };
   }
 

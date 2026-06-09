@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { FlaskConical, Pause, Play, RotateCcw, Send, Square } from "lucide-react";
+import { AlertTriangle, FlaskConical, Home, Pause, Play, RotateCcw, Send, Square } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { defaultRunRequest } from "./agentProtocol";
 import { getPhaseIndex, phases } from "./demoData";
@@ -55,6 +55,9 @@ const localRuntimeSettingsKey = "loading-mind.runtime-settings";
 
 type LocalRuntimeSettings = {
   tavilyApiKey?: string;
+  braveApiKey?: string;
+  firecrawlApiKey?: string;
+  exaApiKey?: string;
   providerConfig?: Partial<ProviderConfig>;
 };
 
@@ -84,7 +87,7 @@ function savedProviderConfig(fallback: ProviderConfig) {
 }
 
 export function App() {
-  const { state, submitTask, pause, resume, cancel, retryTool, excludeEvidence } = useMindstream();
+  const { state, submitTask, pause, resume, cancel, reset, retryTool, excludeEvidence } = useMindstream();
   const [runMode, setRunMode] = useState<RunMode>(defaultRunRequest().runMode);
   const [scene, setScene] = useState<GraphSceneSnapshot>(emptyScene);
   const [viewport, setViewport] = useState({ width: 1440, height: 900 });
@@ -92,12 +95,16 @@ export function App() {
   const [taskDraft, setTaskDraft] = useState(defaultRunRequest().question);
   const [scopeDraft, setScopeDraft] = useState(defaultRunRequest().scope);
   const [tavilyApiKey, setTavilyApiKey] = useState(() => readLocalRuntimeSettings().tavilyApiKey ?? defaultRunRequest().tavilyApiKey ?? "");
+  const [braveApiKey, setBraveApiKey] = useState(() => readLocalRuntimeSettings().braveApiKey ?? defaultRunRequest().braveApiKey ?? "");
+  const [firecrawlApiKey, setFirecrawlApiKey] = useState(() => readLocalRuntimeSettings().firecrawlApiKey ?? defaultRunRequest().firecrawlApiKey ?? "");
+  const [exaApiKey, setExaApiKey] = useState(() => readLocalRuntimeSettings().exaApiKey ?? defaultRunRequest().exaApiKey ?? "");
   const [providerConfig, setProviderConfig] = useState<ProviderConfig>(() => savedProviderConfig(defaultRunRequest().providerConfig));
   const [calibrationQueue, setCalibrationQueue] = useState<string[]>([]);
   const [calibrationIndex, setCalibrationIndex] = useState<number | null>(null);
   const currentPhaseIndex = getPhaseIndex(state.phase);
   const progress = state.status === "completed" ? 100 : Math.min(98, Math.round((state.elapsed / 30000) * 100));
   const latestEvent = state.events[state.events.length - 1];
+  const latestErrorLog = state.errorLogs[state.errorLogs.length - 1];
   const finalArtifact = state.finalReport;
   const sourceLabelMap = useMemo(() => {
     const labels: Record<string, string> = {};
@@ -149,9 +156,12 @@ export function App() {
   useEffect(() => {
     writeLocalRuntimeSettings({
       tavilyApiKey,
+      braveApiKey,
+      firecrawlApiKey,
+      exaApiKey,
       providerConfig
     });
-  }, [providerConfig, tavilyApiKey]);
+  }, [braveApiKey, exaApiKey, firecrawlApiKey, providerConfig, tavilyApiKey]);
 
   const handleReplay = useCallback(() => {
     setReportFocusNodeId(null);
@@ -162,9 +172,19 @@ export function App() {
       sources: state.run?.sources ?? ["web_search", "web_fetch", "document_read"],
       runMode: state.run?.runMode ?? runMode,
       tavilyApiKey,
+      braveApiKey,
+      firecrawlApiKey,
+      exaApiKey,
       providerConfig
     });
-  }, [providerConfig, runMode, scopeDraft, state.run, submitTask, taskDraft, tavilyApiKey]);
+  }, [braveApiKey, exaApiKey, firecrawlApiKey, providerConfig, runMode, scopeDraft, state.run, submitTask, taskDraft, tavilyApiKey]);
+
+  const handleReset = useCallback(() => {
+    setReportFocusNodeId(null);
+    setCalibrationQueue([]);
+    setCalibrationIndex(null);
+    reset();
+  }, [reset]);
 
   const updateProvider = useCallback(<Key extends keyof ProviderConfig>(key: Key, value: ProviderConfig[Key]) => {
     setProviderConfig((current) => ({ ...current, [key]: value }));
@@ -177,8 +197,11 @@ export function App() {
     sources: ["web_search", "web_fetch", "document_read"],
     runMode,
     tavilyApiKey,
+    braveApiKey,
+    firecrawlApiKey,
+    exaApiKey,
     providerConfig
-  }), [providerConfig, runMode, scopeDraft, tavilyApiKey]);
+  }), [braveApiKey, exaApiKey, firecrawlApiKey, providerConfig, runMode, scopeDraft, tavilyApiKey]);
 
   const handleSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -305,6 +328,19 @@ export function App() {
         >
           {centerEventLine}
         </motion.p>
+        {state.status === "failed" && latestErrorLog && (
+          <motion.div
+            className="run-diagnostics"
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            aria-label="Run diagnostics"
+          >
+            <AlertTriangle size={16} />
+            <strong>{latestErrorLog.errorType}</strong>
+            <span>{latestErrorLog.toolName || "runtime"} · {latestErrorLog.phase}</span>
+            <p>{latestErrorLog.nextAction}</p>
+          </motion.div>
+        )}
       </section>
 
       <AnimatePresence>
@@ -403,6 +439,36 @@ export function App() {
                 />
               </label>
               <label>
+                <strong>Brave Search API Key</strong>
+                <input
+                  autoComplete="off"
+                  placeholder="Optional Brave fallback key"
+                  type="password"
+                  value={braveApiKey}
+                  onChange={(event) => setBraveApiKey(event.target.value)}
+                />
+              </label>
+              <label>
+                <strong>Firecrawl API Key</strong>
+                <input
+                  autoComplete="off"
+                  placeholder="Optional search/scrape fallback key"
+                  type="password"
+                  value={firecrawlApiKey}
+                  onChange={(event) => setFirecrawlApiKey(event.target.value)}
+                />
+              </label>
+              <label>
+                <strong>Exa API Key</strong>
+                <input
+                  autoComplete="off"
+                  placeholder="Optional MCP semantic search key"
+                  type="password"
+                  value={exaApiKey}
+                  onChange={(event) => setExaApiKey(event.target.value)}
+                />
+              </label>
+              <label>
                 <strong>LLM API Key</strong>
                 <input
                   autoComplete="off"
@@ -462,6 +528,16 @@ export function App() {
           <button className="icon-button" type="button" onClick={handleReplay} aria-label="Replay" title="Replay">
             <RotateCcw size={17} />
           </button>
+          <button
+            className="icon-button"
+            type="button"
+            onClick={handleReset}
+            disabled={state.status === "idle"}
+            aria-label="Back to start"
+            title="Back to start"
+          >
+            <Home size={17} />
+          </button>
         </div>
       </section>
 
@@ -480,7 +556,7 @@ export function App() {
       />
 
       <ReportDrawer
-        artifact={state.status === "completed" ? finalArtifact : null}
+        artifact={(state.status === "completed" || state.status === "failed") ? finalArtifact : null}
         focusNodeId={reportFocusNodeId}
         onExport={exportRun}
         onFocusSource={setReportFocusNodeId}

@@ -90,6 +90,7 @@ const nodeTierLabel: Record<GraphNodeTier, string> = {
 };
 
 const edgeKindLabel: Record<GraphEdgeKind, string> = {
+  execution_flow: "next step",
   extracts: "extracts",
   queries: "queries",
   returns_source: "returns source",

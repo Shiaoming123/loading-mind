@@ -83,6 +83,37 @@ describe("mindstreamReducer", () => {
     expect(replayed.emphasizedNodeId).toBeNull();
   });
 
+  it("reset returns to the initial idle state", () => {
+    const reset = mindstreamReducer(
+      {
+        ...initialState,
+        status: "failed",
+        run,
+        phase: "drafting",
+        elapsed: 12000,
+        events: [{
+          id: "event",
+          phase: "drafting",
+          timestamp: 12000,
+          message: "event"
+        }],
+        graphNodes: [{ id: "task-brief", kind: "task_intent", label: "Intent" }],
+        graphEdges: [{ id: "edge", from: "task-brief", to: "task-brief", kind: "supports" }],
+        formedClusters: ["intent"],
+        finalReport: {
+          id: "report",
+          kind: "final",
+          title: "Report",
+          body: "Report body"
+        },
+        error: "failed"
+      },
+      { type: "RESET" }
+    );
+
+    expect(reset).toEqual(initialState);
+  });
+
   it("collects graph nodes, edges, clusters, and final report", () => {
     const running = mindstreamReducer(initialState, { type: "START", run });
     const withNode = mindstreamReducer(running, {

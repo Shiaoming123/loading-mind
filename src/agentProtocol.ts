@@ -1,4 +1,4 @@
-import type { AgentEvent, AgentRun, LoadingEvent, ProviderConfig, RunMode } from "./types";
+import type { AgentEvent, AgentRun, LoadingEvent, ProviderConfig, RunErrorLog, RunMode } from "./types";
 
 export type CreateRunRequest = {
   question: string;
@@ -7,6 +7,9 @@ export type CreateRunRequest = {
   sources: string[];
   runMode: RunMode;
   tavilyApiKey?: string;
+  braveApiKey?: string;
+  firecrawlApiKey?: string;
+  exaApiKey?: string;
   providerConfig: ProviderConfig;
   researchMode?: "demo_deep_research";
   sourceBudget?: number;
@@ -16,6 +19,7 @@ export type CreateRunRequest = {
 export type CreateRunResponse = {
   run: AgentRun;
   events?: AgentEvent[];
+  errorLogs?: RunErrorLog[];
   delivery?: "sse" | "snapshot";
 };
 
@@ -38,6 +42,9 @@ export function defaultRunRequest(): CreateRunRequest {
     sources: ["web_search", "web_fetch", "document_read"],
     runMode: "demo",
     tavilyApiKey: "",
+    braveApiKey: "",
+    firecrawlApiKey: "",
+    exaApiKey: "",
     researchMode: "demo_deep_research",
     sourceBudget: 12,
     visualization: "auto",

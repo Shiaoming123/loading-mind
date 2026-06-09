@@ -10,7 +10,7 @@ export type LoadingPhase =
 
 export type VisualIntensity = "quiet" | "focused" | "dense" | "resolved";
 
-export type ArtifactKind = "plan" | "signal" | "insight" | "draft" | "final";
+export type ArtifactKind = "plan" | "signal" | "insight" | "draft" | "final" | "failure";
 
 export type ResearchMode = "demo_deep_research";
 export type RunMode = "demo" | "live";
@@ -48,6 +48,7 @@ export type GraphNodeKind =
   | "section";
 
 export type GraphEdgeKind =
+  | "execution_flow"
   | "extracts"
   | "queries"
   | "returns_source"
@@ -86,6 +87,22 @@ export type ProviderConfig = {
   maxTokens: number;
 };
 
+export type RunErrorLog = {
+  runId: string;
+  mode: RunMode | undefined;
+  phase: LoadingPhase;
+  toolName: string;
+  toolCallId: string;
+  provider: string;
+  statusCode?: number;
+  errorType: string;
+  message: string;
+  redactedInputSummary: string;
+  retryable: boolean;
+  nextAction: string;
+  createdAt: number;
+};
+
 export type ProviderPublicSummary = Omit<ProviderConfig, "apiKey"> & {
   apiKeyMasked: string;
 };
@@ -114,6 +131,7 @@ export type ToolCallRecord = {
   status: ToolStatus;
   costMs?: number;
   error?: string;
+  retryOf?: string;
 };
 
 export type EvidenceRecord = {
@@ -154,6 +172,12 @@ export type GraphNode = {
   tier?: GraphNodeTier;
   importance?: number;
   reportAnchorId?: string;
+  executionStep?: {
+    stepId: "plan" | "search" | "fetch" | "rank" | "extract" | "verify" | "visualize" | "write";
+    stepIndex: number;
+    stepLabel: string;
+    stepStatus: "queued" | "running" | "completed" | "degraded" | "failed";
+  };
   layout?: {
     x?: number;
     y?: number;
@@ -259,6 +283,24 @@ export type ReportSection = {
   sourceNodeIds: string[];
 };
 
+export type ClaimGraphClaim = {
+  id: string;
+  label: string;
+  status?: string;
+  supportCount?: number;
+  confidence?: number;
+  evidenceIds?: string[];
+  sourceTitles?: string[];
+};
+
+export type ClaimGraphEvidence = {
+  id: string;
+  title: string;
+  sourceId?: string;
+  sourceTitle?: string;
+  quote?: string;
+};
+
 export type ArtifactBlock =
   | {
       id: string;
@@ -288,6 +330,8 @@ export type ArtifactBlock =
       title: string;
       nodes: Array<{ id: string; label: string; kind: GraphNodeKind }>;
       edges: Array<{ from: string; to: string; kind: GraphEdgeKind }>;
+      claims?: ClaimGraphClaim[];
+      evidence?: ClaimGraphEvidence[];
       sourceNodeIds?: string[];
     };
 
@@ -357,6 +401,7 @@ export type AgentEvent = {
   evidence?: EvidenceRecord;
   finalReport?: Artifact;
   error?: string;
+  errorLog?: RunErrorLog;
 };
 
 export type TaskStatus = RunStatus;
@@ -373,6 +418,7 @@ export type MindstreamState = {
   formedClusters: GraphCluster[];
   emphasizedNodeId: string | null;
   finalReport: Artifact | null;
+  errorLogs: RunErrorLog[];
   excludedEvidenceIds: string[];
   error: string | null;
 };

@@ -305,6 +305,46 @@ button {
   text-shadow: 0 1px 0 rgba(255, 252, 244, 0.76);
 }
 
+.run-diagnostics {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 8px 10px;
+  align-items: center;
+  width: min(440px, 100%);
+  margin-top: 18px;
+  border: 1px solid rgba(180, 73, 42, 0.24);
+  border-radius: 18px;
+  padding: 12px 14px;
+  background: rgba(255, 248, 236, 0.82);
+  box-shadow: 0 18px 42px rgba(82, 45, 31, 0.12);
+  color: var(--graphite);
+  pointer-events: auto;
+}
+
+.run-diagnostics svg {
+  color: #b4492a;
+}
+
+.run-diagnostics strong {
+  color: #8d321b;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.run-diagnostics span {
+  color: var(--graphite-soft);
+  font-size: 12px;
+}
+
+.run-diagnostics p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: rgba(47, 43, 37, 0.74);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .telemetry {
   position: fixed;
   z-index: 6;
@@ -1102,16 +1142,23 @@ button {
 
 .claim-graph-block {
   display: grid;
-  grid-template-columns: 72px 72px 1fr;
-  gap: 10px;
-  align-items: center;
+  gap: 12px;
 }
 
-.claim-graph-block div {
+.claim-graph-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.claim-graph-metrics div {
   display: grid;
+  min-width: 78px;
   gap: 2px;
   border: 1px solid rgba(47, 43, 37, 0.1);
+  border-radius: 8px;
   padding: 8px;
+  background: rgba(255, 252, 244, 0.58);
 }
 
 .claim-graph-block strong {
@@ -1124,6 +1171,77 @@ button {
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.claim-graph-claims {
+  display: grid;
+  gap: 10px;
+}
+
+.claim-graph-card {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  border: 1px solid rgba(47, 43, 37, 0.1);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(255, 250, 240, 0.72);
+  color: var(--graphite);
+  cursor: pointer;
+  text-align: left;
+}
+
+.claim-graph-card strong {
+  color: var(--graphite);
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.claim-graph-card small {
+  color: var(--graphite-soft);
+  font-size: 11px;
+}
+
+.claim-status {
+  width: max-content;
+  border-radius: 999px;
+  padding: 3px 7px;
+  background: rgba(62, 133, 129, 0.12);
+  color: var(--teal);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.claim-status.status-conflicted {
+  background: rgba(172, 72, 45, 0.12);
+  color: #ac482d;
+}
+
+.claim-status.status-weak,
+.claim-status.status-unknown {
+  background: rgba(217, 130, 43, 0.14);
+  color: var(--amber);
+}
+
+.claim-source-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.claim-source-chips em {
+  border: 1px solid rgba(47, 43, 37, 0.1);
+  border-radius: 999px;
+  padding: 3px 7px;
+  background: rgba(255, 255, 255, 0.48);
+  color: rgba(47, 43, 37, 0.6);
+  font-size: 10px;
+  font-style: normal;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .report-article button {
@@ -1168,6 +1286,24 @@ button {
   font-size: 10px;
   font-style: normal;
   letter-spacing: 0.06em;
+}
+
+.report-article .claim-graph-card {
+  display: grid;
+  gap: 7px;
+  border: 1px solid rgba(47, 43, 37, 0.1);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(255, 250, 240, 0.72);
+}
+
+.report-article .claim-graph-card strong {
+  color: var(--graphite);
+}
+
+.report-article .claim-source-chips em {
+  color: rgba(47, 43, 37, 0.6);
+  letter-spacing: 0;
 }
 
 @media (max-width: 980px) {

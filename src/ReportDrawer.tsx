@@ -59,7 +59,7 @@ function blockPreview(block: ArtifactBlock) {
     case "mermaid":
       return textPreview(block.code, 90);
     case "claim_graph":
-      return `${block.nodes.length} nodes / ${block.edges.length} edges`;
+      return `${block.claims?.length ?? block.nodes.filter((node) => node.kind === "claim").length} claims / ${block.edges.length} evidence links`;
   }
 }
 
@@ -113,6 +113,99 @@ function MermaidBlock({ code }: { code: string }) {
   );
 }
 
+function claimStatusLabel(status?: string) {
+  if (status === "verified") {
+    return "Verified";
+  }
+  if (status === "conflicted") {
+    return "Conflicted";
+  }
+  if (status === "weak") {
+    return "Weak";
+  }
+  return "Review";
+}
+
+function readableClaimGraphClaims(block: Extract<ArtifactBlock, { type: "claim_graph" }>, sourceLabelMap: SourceLabelMap) {
+  if (block.claims && block.claims.length > 0) {
+    return block.claims;
+  }
+  return block.nodes
+    .filter((node) => node.kind === "claim")
+    .map((node) => {
+      const evidenceIds = block.edges.filter((edge) => edge.to === node.id).map((edge) => edge.from);
+      return {
+        id: node.id,
+        label: node.label,
+        status: "unknown",
+        supportCount: evidenceIds.length,
+        confidence: 0,
+        evidenceIds,
+        sourceTitles: evidenceIds.slice(0, 3).map((id) => sourceLabelMap[id] ?? id)
+      };
+    });
+}
+
+function ClaimGraphBlock({
+  block,
+  expanded,
+  sourceLabelMap,
+  onFocusSource
+}: {
+  block: Extract<ArtifactBlock, { type: "claim_graph" }>;
+  expanded: boolean;
+  sourceLabelMap: SourceLabelMap;
+  onFocusSource: (nodeId: string | null) => void;
+}) {
+  const claims = readableClaimGraphClaims(block, sourceLabelMap);
+  const visibleClaims = expanded ? claims : claims.slice(0, 3);
+
+  return (
+    <div className="claim-graph-block">
+      <div className="claim-graph-metrics" aria-label="Claim graph summary">
+        <div>
+          <strong>{claims.length}</strong>
+          <span>claims</span>
+        </div>
+        <div>
+          <strong>{block.edges.length}</strong>
+          <span>links</span>
+        </div>
+      </div>
+      <div className="claim-graph-claims">
+        {visibleClaims.map((claim) => {
+          const evidenceIds = claim.evidenceIds ?? [];
+          const sourceTitles = (claim.sourceTitles ?? [])
+            .map((title) => sourceLabelMap[title] ?? title)
+            .filter(Boolean)
+            .slice(0, 3);
+          const focusId = evidenceIds[0] ?? claim.id;
+          return (
+            <button
+              className="claim-graph-card"
+              key={claim.id}
+              onClick={() => onFocusSource(focusId)}
+              type="button"
+            >
+              <span className={`claim-status status-${claim.status ?? "unknown"}`}>{claimStatusLabel(claim.status)}</span>
+              <strong>{claim.label}</strong>
+              <small>
+                {(claim.supportCount ?? evidenceIds.length) || evidenceIds.length} supporting sources
+                {claim.confidence ? ` / confidence ${Number(claim.confidence).toFixed(2)}` : ""}
+              </small>
+              {sourceTitles.length > 0 && (
+                <div className="claim-source-chips">
+                  {sourceTitles.map((title) => <em key={`${claim.id}-${title}`}>{title}</em>)}
+                </div>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ReportBlock({
   block,
   expanded,
@@ -155,26 +248,7 @@ function ReportBlock({
         </div>
       )}
       {block.type === "mermaid" && <MermaidBlock code={block.code} />}
-      {block.type === "claim_graph" && (
-        <div className="claim-graph-block">
-          <div>
-            <strong>{block.nodes.length}</strong>
-            <span>nodes</span>
-          </div>
-          <div>
-            <strong>{block.edges.length}</strong>
-            <span>edges</span>
-          </div>
-          <p>{block.nodes.slice(0, 5).map((node) => node.label).join(" / ")}</p>
-          {expanded && (
-            <ul>
-              {block.edges.slice(0, 12).map((edge, index) => (
-                <li key={`${edge.from}-${edge.to}-${index}`}>{edge.from} {"->"} {edge.to} · {edge.kind}</li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
+      {block.type === "claim_graph" && <ClaimGraphBlock block={block} expanded={expanded} sourceLabelMap={sourceLabelMap} onFocusSource={onFocusSource} />}
       {block.sourceNodeIds && block.sourceNodeIds.length > 0 && <em>{sourceLabel(block.sourceNodeIds, sourceLabelMap)}</em>}
     </section>
   );
@@ -279,7 +353,7 @@ export function ReportDrawer({
           aria-label="Final report drawer"
         >
           <header className="report-drawer-header">
-            <span>FINAL REPORT</span>
+            <span>{artifact.kind === "failure" ? "FAILURE REPORT" : "FINAL REPORT"}</span>
             <div className="report-drawer-actions">
               <button type="button" onClick={() => setExpanded((value) => !value)} aria-label={expanded ? "Collapse report" : "Expand report"} title={expanded ? "Collapse report" : "Expand report"}>
                 {expanded ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}

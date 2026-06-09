@@ -26,6 +26,8 @@ export function publicRunPayload(run) {
         : undefined
     },
     events: run.events,
+    errorLogs: run.errorLogs ?? [],
+    auditLogs: run.auditLogs ?? [],
     excludedEvidenceIds: [...run.excludedEvidenceIds]
   };
 }
@@ -70,6 +72,34 @@ export function runToMarkdown(run) {
     }
   }
 
+  lines.push("", "## Error Logs", "");
+  const errorLogs = run.errorLogs ?? [];
+  if (errorLogs.length === 0) {
+    lines.push("- No run errors recorded.");
+  } else {
+    for (const errorLog of errorLogs) {
+      lines.push(`- ${errorLog.phase} / ${errorLog.toolName || "runtime"}: ${errorLog.errorType}`);
+      lines.push(`  - Message: ${errorLog.message}`);
+      lines.push(`  - Next action: ${errorLog.nextAction}`);
+    }
+  }
+
+  lines.push("", "## Audit Logs", "");
+  const auditLogs = run.auditLogs ?? [];
+  if (auditLogs.length === 0) {
+    lines.push("- No audit logs recorded.");
+  } else {
+    for (const auditLog of auditLogs) {
+      lines.push(`- ${auditLog.toolName} / ${auditLog.mcpTool}: ${auditLog.status}`);
+      if (auditLog.outputSummary) {
+        lines.push(`  - Output: ${auditLog.outputSummary}`);
+      }
+      if (auditLog.error) {
+        lines.push(`  - Error: ${auditLog.error}`);
+      }
+    }
+  }
+
   lines.push("", "## Evidence", "");
   if (evidence.length === 0) {
     lines.push("- No evidence recorded.");
@@ -99,7 +129,15 @@ export function runToMarkdown(run) {
         }
         lines.push("");
       } else if (block.type === "claim_graph") {
-        lines.push(`Claim graph: ${block.nodes.length} nodes, ${block.edges.length} edges.`, "");
+        lines.push(`Claim graph: ${block.claims?.length ?? block.nodes.length} claims, ${block.edges.length} evidence links.`, "");
+        for (const claim of block.claims ?? []) {
+          lines.push(`- ${claim.label} (${claim.status || "review"}, ${claim.supportCount ?? claim.evidenceIds?.length ?? 0} supporting sources)`);
+          const sourceTitles = claim.sourceTitles ?? [];
+          if (sourceTitles.length > 0) {
+            lines.push(`  - Sources: ${sourceTitles.join(" / ")}`);
+          }
+        }
+        lines.push("");
       }
     }
     for (const section of report.sections ?? []) {

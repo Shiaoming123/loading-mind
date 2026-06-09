@@ -6,7 +6,8 @@ import {
   normalizeProviderResult,
   parseProviderJson,
   pickMimoModel,
-  providerDefaults
+  providerDefaults,
+  shouldDiscoverModel
 } from "./providerClient.mjs";
 
 const messages = [
@@ -91,5 +92,12 @@ describe("providerClient", () => {
 
   it("masks API keys for public surfaces", () => {
     expect(maskApiKey("tp-c21wxh0dkb0bc24n2i9fs5ng5wc2xwhw0mrxesbmnqdw0vc6")).toBe("tp-c21...vc6");
+  });
+
+  it("does not treat provider auth failures as model discovery errors", () => {
+    expect(shouldDiscoverModel(new Error("Invalid API Key"))).toBe(false);
+    expect(shouldDiscoverModel(new Error("Provider HTTP 401"))).toBe(false);
+    expect(shouldDiscoverModel(new Error("model not found"))).toBe(true);
+    expect(shouldDiscoverModel(new Error("invalid model name"))).toBe(true);
   });
 });

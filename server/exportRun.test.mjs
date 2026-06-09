@@ -70,6 +70,21 @@ function runFixture() {
           kind: "final",
           title: "Report",
           body: "Report body",
+          blocks: [{
+            id: "claim-graph",
+            type: "claim_graph",
+            title: "Readable claim graph",
+            nodes: [{ id: "claim-1", label: "成本与额度约束会影响高频工程使用", kind: "claim" }],
+            edges: [{ from: "evidence-1", to: "claim-1", kind: "supports" }],
+            claims: [{
+              id: "claim-1",
+              label: "成本与额度约束会影响高频工程使用",
+              status: "verified",
+              supportCount: 1,
+              evidenceIds: ["evidence-1"],
+              sourceTitles: ["Source"]
+            }]
+          }],
           sections: [{
             id: "section-context",
             title: "Context",
@@ -88,6 +103,8 @@ describe("exportRun", () => {
 
     expect(markdown).toContain("# Report");
     expect(markdown).toContain("LLM Analyze");
+    expect(markdown).toContain("成本与额度约束会影响高频工程使用");
+    expect(markdown).not.toContain("evidence-1 -> claim-1");
     expect(markdown).toContain("tp-c21...vc6");
     expect(markdown).not.toContain("tp-c21wxh0dkb0bc24n2i9fs5ng5wc2xwhw0mrxesbmnqdw0vc6");
   });

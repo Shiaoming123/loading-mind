@@ -247,6 +247,14 @@ export async function discoverMimoModel(config, fetchImpl = fetch) {
   return pickMimoModel(data);
 }
 
+export function shouldDiscoverModel(error) {
+  const message = String(error?.message || "");
+  if (/api[_ -]?key|unauthorized|forbidden|401|403/i.test(message)) {
+    return false;
+  }
+  return /model|not found|invalid model/i.test(message);
+}
+
 export async function callProvider(config, messages, options = {}) {
   const fetchImpl = options.fetchImpl ?? fetch;
   const startedAt = Date.now();
@@ -260,7 +268,7 @@ export async function callProvider(config, messages, options = {}) {
       const data = await postJson(fetchImpl, request, controller.signal);
       return normalizeProviderResult(activeConfig.protocol, data, Date.now() - startedAt);
     } catch (error) {
-      if (activeConfig.protocol !== "openai" || !/model|not found|invalid/i.test(String(error?.message || ""))) {
+      if (activeConfig.protocol !== "openai" || !shouldDiscoverModel(error)) {
         throw error;
       }
       const discoveredModel = await discoverMimoModel(activeConfig, fetchImpl);

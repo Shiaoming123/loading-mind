@@ -39,6 +39,8 @@ function persist(run) {
   fs.writeFileSync(path.join(dataDir, `${run.meta.id}.json`), JSON.stringify({
     meta: run.meta,
     events: run.events,
+    errorLogs: run.errorLogs ?? [],
+    auditLogs: run.auditLogs ?? [],
     excludedEvidenceIds: [...run.excludedEvidenceIds]
   }, null, 2));
 }
@@ -143,6 +145,402 @@ function toolFailureError(toolResult, label) {
   return toolResult.toolCall.error || `${label} failed`;
 }
 
+const secretKeyPattern = /api[_-]?key|token|authorization|password|secret|credential/i;
+
+function redactValue(key, value) {
+  if (secretKeyPattern.test(key)) {
+    return value ? "[redacted]" : "";
+  }
+  if (value && typeof value === "object") {
+    return redactSecrets(value);
+  }
+  return value;
+}
+
+function redactSecrets(value) {
+  if (Array.isArray(value)) {
+    return value.slice(0, 8).map((item) => redactSecrets(item));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).slice(0, 24).map(([key, entryValue]) => [key, redactValue(key, entryValue)])
+  );
+}
+
+function compactJson(value, maxLength = 640) {
+  const text = JSON.stringify(redactSecrets(value ?? {}));
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function inferStatusCode(error, message) {
+  if (Number.isFinite(error?.statusCode)) {
+    return Number(error.statusCode);
+  }
+  if (Number.isFinite(error?.status)) {
+    return Number(error.status);
+  }
+  const match = String(message || "").match(/\bHTTP\s+(\d{3})\b/i);
+  return match ? Number(match[1]) : undefined;
+}
+
+function inferErrorType(message, toolName = "") {
+  const text = `${toolName} ${message}`.toLowerCase();
+  if (/invalid api key|unauthorized|forbidden|401|403/.test(text)) {
+    return "auth";
+  }
+  if (/api[_ -]?key|required|not configured|missing key/.test(text)) {
+    return "missing_key";
+  }
+  if (/rate limit|429/.test(text)) {
+    return "rate_limit";
+  }
+  if (/abort|timeout|terminated/.test(text)) {
+    return "timeout";
+  }
+  if (/mcp/.test(text)) {
+    return "mcp";
+  }
+  if (/search|tavily|brave|firecrawl|exa/.test(text)) {
+    return "search";
+  }
+  if (/report|artifact|format|mermaid|markdown|json/.test(text)) {
+    return "report_format";
+  }
+  if (/provider|model|openai|anthropic|mimo/.test(text)) {
+    return "provider";
+  }
+  if (/fetch|network|http/.test(text)) {
+    return "network";
+  }
+  return "unknown";
+}
+
+function nextActionFor(errorType, toolName) {
+  if (errorType === "missing_key") {
+    return "Add the required API key or switch to Demo mode.";
+  }
+  if (errorType === "auth") {
+    return "Check the configured key, base URL, model, and provider permissions.";
+  }
+  if (errorType === "rate_limit") {
+    return "Wait for quota recovery or switch to another configured provider.";
+  }
+  if (errorType === "timeout") {
+    return "Retry the run; if it repeats, use another search/fetch provider.";
+  }
+  if (errorType === "report_format" || toolName === "report_write") {
+    return "Regenerate the report after fixing provider output or artifact formatting.";
+  }
+  if (errorType === "mcp") {
+    return "Use an allowlisted read-only MCP tool or disable MCP for this run.";
+  }
+  return "Inspect the failed tool node, then retry or rerun after fixing the configuration.";
+}
+
+function latestFailedTool(run) {
+  for (let index = run.events.length - 1; index >= 0; index -= 1) {
+    const node = run.events[index].graphEvent?.node;
+    if (node?.kind === "tool_call" && node.toolCall?.status === "failed") {
+      return node;
+    }
+  }
+  return null;
+}
+
+export function createRunErrorLog(run, error, options = {}) {
+  const message = error instanceof Error ? error.message : String(error || "Unknown error");
+  const failedTool = options.toolNode ?? latestFailedTool(run);
+  const toolCall = failedTool?.toolCall;
+  const toolName = options.toolName ?? toolCall?.toolName ?? "";
+  const errorType = inferErrorType(message, toolName);
+  const provider = options.provider
+    || failedTool?.attributes?.provider
+    || (toolName === "report_write" ? run.meta.provider?.protocol : "")
+    || "";
+  const toolCallId = options.toolCallId ?? (options.toolName ? "" : toolCall?.id) ?? "";
+  return {
+    runId: run.meta.id,
+    mode: run.meta.runMode,
+    phase: options.phase ?? run.events.at(-1)?.phase ?? "initializing",
+    toolName,
+    toolCallId,
+    provider,
+    statusCode: inferStatusCode(error, message),
+    errorType,
+    message,
+    redactedInputSummary: compactJson(options.input ?? toolCall?.input ?? {}),
+    retryable: !["missing_key", "auth"].includes(errorType),
+    nextAction: nextActionFor(errorType, toolName),
+    createdAt: now()
+  };
+}
+
+function recordRunError(run, error, options = {}) {
+  const errorLog = createRunErrorLog(run, error, options);
+  run.errorLogs.push(errorLog);
+  run.meta.errorLog = errorLog;
+  return errorLog;
+}
+
+function recordMcpAudit(run, entry) {
+  const auditLog = {
+    runId: run.meta.id,
+    toolName: "mcp.invoke",
+    mcpTool: String(entry.mcpTool || ""),
+    status: entry.status,
+    provider: String(entry.provider || ""),
+    redactedInputSummary: compactJson(entry.input ?? {}),
+    outputSummary: entry.outputSummary ? String(entry.outputSummary).slice(0, 480) : "",
+    error: entry.error ? String(entry.error).slice(0, 480) : "",
+    createdAt: now()
+  };
+  run.auditLogs.push(auditLog);
+  return auditLog;
+}
+
+function failureReportFromErrorLog(run, errorLog) {
+  const title = `Run failed: ${errorLog.errorType}`;
+  const body = [
+    `Run ${run.meta.id} stopped during ${errorLog.phase}.`,
+    `Failed tool: ${errorLog.toolName || "runtime"}${errorLog.toolCallId ? ` (${errorLog.toolCallId})` : ""}.`,
+    `Reason: ${errorLog.message}`,
+    `Next action: ${errorLog.nextAction}`
+  ].join("\n\n");
+  return {
+    id: `failure-report-${run.meta.id}`,
+    kind: "failure",
+    title,
+    body,
+    sections: [{
+      id: "failure-summary",
+      title: "Failure summary",
+      body,
+      sourceNodeIds: errorLog.toolCallId ? [errorLog.toolCallId] : ["task-intent"]
+    }],
+    blocks: [{
+      id: "failure-log",
+      type: "table",
+      title: "Run error log",
+      columns: ["field", "value"],
+      rows: Object.entries({
+        runId: errorLog.runId,
+        mode: errorLog.mode,
+        phase: errorLog.phase,
+        toolName: errorLog.toolName || "runtime",
+        toolCallId: errorLog.toolCallId || "none",
+        provider: errorLog.provider || "none",
+        statusCode: errorLog.statusCode ?? "none",
+        errorType: errorLog.errorType,
+        retryable: String(errorLog.retryable),
+        nextAction: errorLog.nextAction
+      }).map(([field, value]) => ({ field, value })),
+      sourceNodeIds: errorLog.toolCallId ? [errorLog.toolCallId] : ["task-intent"]
+    }, {
+      id: "failure-input",
+      type: "markdown",
+      title: "Redacted input summary",
+      body: `\`\`\`json\n${errorLog.redactedInputSummary}\n\`\`\``,
+      sourceNodeIds: errorLog.toolCallId ? [errorLog.toolCallId] : ["task-intent"]
+    }]
+  };
+}
+
+function validSourceIds(run) {
+  const ids = new Set(["task-intent"]);
+  for (const event of run.events) {
+    const node = event.graphEvent?.node;
+    if (node?.id) {
+      ids.add(node.id);
+    }
+  }
+  return ids;
+}
+
+function normalizeSourceNodeIds(sourceNodeIds, validIds, fallback = ["task-intent"]) {
+  const ids = Array.isArray(sourceNodeIds)
+    ? sourceNodeIds.map(String).filter((id) => validIds.has(id))
+    : [];
+  return ids.length > 0 ? ids : fallback.filter((id) => validIds.has(id));
+}
+
+function validMermaidCode(code) {
+  return /^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|journey|gantt|pie|mindmap)\b/i.test(String(code || "").trim());
+}
+
+function normalizeClaimGraphBlock(block, id, sourceNodeIds) {
+  const nodes = Array.isArray(block.nodes) ? block.nodes.filter((node) => node?.id && node?.label) : [];
+  const edges = Array.isArray(block.edges) ? block.edges.filter((edge) => edge?.from && edge?.to) : [];
+  if (nodes.length === 0) {
+    return null;
+  }
+  const nodeById = new Map(nodes.map((node) => [String(node.id), node]));
+  const evidence = Array.isArray(block.evidence)
+    ? block.evidence
+      .filter((item) => item?.id)
+      .map((item) => ({
+        id: String(item.id),
+        title: String(item.title || item.sourceTitle || item.id),
+        sourceId: item.sourceId ? String(item.sourceId) : undefined,
+        sourceTitle: String(item.sourceTitle || item.title || item.id),
+        quote: compactText(item.quote || "", 180)
+      }))
+    : [];
+  const evidenceByBlockId = new Map(evidence.map((item) => [item.id, item]));
+  const claims = Array.isArray(block.claims) && block.claims.length > 0
+    ? block.claims
+      .filter((claim) => claim?.id && claim?.label)
+      .map((claim) => ({
+        id: String(claim.id),
+        label: String(claim.label),
+        status: String(claim.status || "unknown"),
+        supportCount: Number.isFinite(Number(claim.supportCount)) ? Number(claim.supportCount) : 0,
+        confidence: Number.isFinite(Number(claim.confidence)) ? Number(claim.confidence) : 0,
+        evidenceIds: Array.isArray(claim.evidenceIds) ? claim.evidenceIds.map(String) : [],
+        sourceTitles: Array.isArray(claim.sourceTitles) ? claim.sourceTitles.map(String).filter(Boolean).slice(0, 3) : []
+      }))
+    : nodes
+      .filter((node) => node.kind === "claim")
+      .map((node) => {
+        const evidenceIds = edges.filter((edge) => edge.to === node.id).map((edge) => String(edge.from));
+        const sourceTitles = evidenceIds
+          .map((evidenceId) => evidenceByBlockId.get(evidenceId)?.sourceTitle || nodeById.get(evidenceId)?.label || evidenceId)
+          .filter(Boolean)
+          .slice(0, 3);
+        return {
+          id: String(node.id),
+          label: String(node.label),
+          status: "unknown",
+          supportCount: evidenceIds.length,
+          confidence: 0,
+          evidenceIds,
+          sourceTitles
+        };
+      });
+  return {
+    ...block,
+    id,
+    title: String(block.title || "Claim graph"),
+    nodes,
+    edges,
+    claims,
+    evidence,
+    sourceNodeIds
+  };
+}
+
+export function validateAndNormalizeArtifact(artifact, run) {
+  if (!artifact || typeof artifact !== "object") {
+    throw new Error("Report artifact is missing");
+  }
+  const validIds = validSourceIds(run);
+  const title = String(artifact.title || "Loading Mind Report").trim();
+  let sections = Array.isArray(artifact.sections) ? artifact.sections : [];
+  sections = sections.map((section, index) => ({
+    id: String(section?.id || `section-${index + 1}`),
+    title: String(section?.title || `Section ${index + 1}`),
+    body: String(section?.body || "").trim(),
+    sourceNodeIds: normalizeSourceNodeIds(section?.sourceNodeIds, validIds)
+  })).filter((section) => section.body);
+
+  let blocks = Array.isArray(artifact.blocks) ? artifact.blocks : [];
+  blocks = blocks.flatMap((block, index) => {
+    const id = String(block?.id || `block-${index + 1}`);
+    const sourceNodeIds = normalizeSourceNodeIds(block?.sourceNodeIds, validIds);
+    if (block?.type === "markdown") {
+      const body = String(block.body || "").trim();
+      return body ? [{ ...block, id, body, sourceNodeIds }] : [];
+    }
+    if (block?.type === "table" || block?.type === "source_matrix") {
+      const columns = Array.isArray(block.columns) ? block.columns.map(String).filter(Boolean) : [];
+      if (columns.length === 0) {
+        return [];
+      }
+      const rows = (Array.isArray(block.rows) ? block.rows : []).map((row) =>
+        Object.fromEntries(columns.map((column) => [column, row?.[column] ?? ""]))
+      );
+      return [{ ...block, id, title: String(block.title || "Table"), columns, rows, sourceNodeIds }];
+    }
+    if (block?.type === "mermaid") {
+      const code = String(block.code || "").trim();
+      if (!validMermaidCode(code)) {
+        return [{
+          id,
+          type: "markdown",
+          title: String(block.title || "Visualization"),
+          body: "Mermaid block could not be validated and was converted to text.",
+          sourceNodeIds
+        }];
+      }
+      return [{ ...block, id, code, sourceNodeIds }];
+    }
+    if (block?.type === "claim_graph") {
+      const normalizedBlock = normalizeClaimGraphBlock(block, id, sourceNodeIds);
+      return normalizedBlock ? [normalizedBlock] : [];
+    }
+    return [];
+  });
+
+  if (sections.length === 0 && blocks.length === 0) {
+    throw new Error("Report artifact contains no renderable sections or blocks");
+  }
+  if (sections.length === 0) {
+    sections = blocks.slice(0, 3).map((block, index) => ({
+      id: `section-from-${block.id || index + 1}`,
+      title: block.title || `Section ${index + 1}`,
+      body: block.type === "markdown" ? block.body : `${block.title || block.type} is available as a structured report block.`,
+      sourceNodeIds: normalizeSourceNodeIds(block.sourceNodeIds, validIds)
+    }));
+  }
+  const body = String(artifact.body || "").trim() || sections[0]?.body || "Report body was normalized from structured sections.";
+  if (!title || !body) {
+    throw new Error("Report artifact title/body could not be normalized");
+  }
+  return {
+    ...artifact,
+    kind: artifact.kind || "final",
+    title,
+    body,
+    sections,
+    blocks
+  };
+}
+
+const executionSteps = {
+  plan: { stepId: "plan", stepIndex: 1, stepLabel: "Plan" },
+  search: { stepId: "search", stepIndex: 2, stepLabel: "Search" },
+  fetch: { stepId: "fetch", stepIndex: 3, stepLabel: "Fetch" },
+  rank: { stepId: "rank", stepIndex: 4, stepLabel: "Rank" },
+  extract: { stepId: "extract", stepIndex: 5, stepLabel: "Extract" },
+  verify: { stepId: "verify", stepIndex: 6, stepLabel: "Verify" },
+  visualize: { stepId: "visualize", stepIndex: 7, stepLabel: "Visualize" },
+  write: { stepId: "write", stepIndex: 8, stepLabel: "Write" }
+};
+
+function executionStep(stepId, stepStatus = "completed") {
+  return {
+    ...executionSteps[stepId],
+    stepStatus
+  };
+}
+
+function executionEdge(id, from, to, confidence = 0.86) {
+  return {
+    id,
+    from,
+    to,
+    kind: "execution_flow",
+    label: "next step",
+    confidence,
+    strength: 0.9,
+    distance: 112,
+    semanticPriority: 7,
+    displayMode: "active",
+    status: "active"
+  };
+}
+
 export function assertToolOk(toolResult, label) {
   if (!toolResult.ok) {
     throw new Error(`${label} failed: ${toolFailureError(toolResult, label)}`);
@@ -204,6 +602,7 @@ async function toolCall(run, toolName, input, label, executor, options = {}) {
   const failurePolicy = options.failurePolicy ?? "record";
   const phase = options.phase ?? "evidence";
   const cluster = options.cluster ?? "evidence";
+  const nodeExtra = options.nodeExtra ?? {};
   const startedAt = now();
   const id = `${toolName}-${run.toolIndex += 1}`;
   const running = {
@@ -214,7 +613,7 @@ async function toolCall(run, toolName, input, label, executor, options = {}) {
     status: "running",
     ...(options.retryOf ? { retryOf: options.retryOf } : {})
   };
-  nodeEvent(run, phase, `${label} 已进入工具队列。`, toolNode(running, label, "工具正在执行真实请求。", { cluster }));
+  nodeEvent(run, phase, `${label} 已进入工具队列。`, toolNode(running, label, "工具正在执行真实请求。", { cluster, ...nodeExtra }));
 
   try {
     const output = await executor();
@@ -226,7 +625,7 @@ async function toolCall(run, toolName, input, label, executor, options = {}) {
       outputSummary: output.summary,
       outputAttributes: output.toolAttributes
     };
-    nodeEvent(run, phase, `${label} 已返回 observation。`, toolNode(finished, label, output.summary, { cluster }), "node_updated");
+    nodeEvent(run, phase, `${label} 已返回 observation。`, toolNode(finished, label, output.summary, { cluster, ...nodeExtra }), "node_updated");
     return { ok: true, toolCall: finished, output };
   } catch (error) {
     const failed = {
@@ -237,7 +636,7 @@ async function toolCall(run, toolName, input, label, executor, options = {}) {
       error: error instanceof Error ? error.message : "Unknown tool failure",
       outputSummary: "工具调用失败，已把失败状态写入图谱，可重试。"
     };
-    nodeEvent(run, phase, `${label} 失败，等待用户重试或继续。`, toolNode(failed, label, failed.outputSummary, { cluster }), "node_updated");
+    nodeEvent(run, phase, `${label} 失败，等待用户重试或继续。`, toolNode(failed, label, failed.outputSummary, { cluster, ...nodeExtra }), "node_updated");
     const result = { ok: false, toolCall: failed, output: { summary: failed.outputSummary, items: [] } };
     if (failurePolicy === "throw") {
       throw new Error(`${label} failed: ${failed.error}`);
@@ -252,7 +651,8 @@ async function runRegisteredTool(run, registry, toolName, input, options = {}) {
     failurePolicy: tool.failurePolicy,
     phase: tool.phase,
     cluster: tool.cluster,
-    retryOf: options.retryOf
+    retryOf: options.retryOf,
+    nodeExtra: options.nodeExtra
   });
 }
 
@@ -324,12 +724,42 @@ function demoSearchItems(query) {
   for (const character of String(query || "")) {
     hash = (Math.imul(hash, 31) + character.charCodeAt(0)) >>> 0;
   }
-  const slug = String(query || "research")
+  const demoTopic = String(query || "research")
+    .replace(/\b(deep research|workflow|citations|report|evidence|sources|cases|analysis|risks|limitations|counterexamples|verification|structured|visualization|matrix)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const slug = String(demoTopic || "research")
     .toLowerCase()
     .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 42) || "research";
   const branch = hash.toString(36).slice(0, 6);
+  if (isComparisonQuestion(query)) {
+    const subjects = comparisonSubjects(demoTopic);
+    const subjectLabel = subjects.length >= 2 ? `${subjects[0]} / ${subjects[1]}` : String(demoTopic || "候选对象");
+    return [
+      {
+        title: `${subjectLabel}：选择不应只看单次输出`,
+        url: `demo://${slug}-${branch}/decision-frame`,
+        text: `围绕“${demoTopic}”，对比报告需要先拆出速度、成本、上下文、工作流和可靠性等维度，再判断不同场景怎么选。`
+      },
+      {
+        title: `${subjectLabel}：速度、成本与额度需要分开比较`,
+        url: `demo://${slug}-${branch}/speed-cost`,
+        text: "短任务体感通常受首响速度、推理深度、可见 token 输出和额度限制共同影响；不能只用一次生成结果概括工具优劣。"
+      },
+      {
+        title: `${subjectLabel}：工作流入口和上下文决定长链路表现`,
+        url: `demo://${slug}-${branch}/workflow-context`,
+        text: "复杂工程任务更依赖 CLI/IDE 入口、仓库上下文、分支探索、多步骤执行和失败恢复能力，这些因素会改变真实生产体验。"
+      },
+      {
+        title: `${subjectLabel}：风险、反例与适用人群`,
+        url: `demo://${slug}-${branch}/risk-fit`,
+        text: "工具选择应保留风险和反例：同一个工具可能适合个人快速试错，却不一定适合团队级长任务、严格审查或预算受限场景。"
+      }
+    ];
+  }
   return [
     {
       title: "深研任务需要先规划再检索",
@@ -355,6 +785,21 @@ function demoSearchItems(query) {
 }
 
 function demoFetchedText(query) {
+  if (isComparisonQuestion(query)) {
+    const demoTopic = String(query || "")
+      .replace(/\b(deep research|workflow|citations|report|evidence|sources|cases|analysis|risks|limitations|counterexamples|verification|structured|visualization|matrix)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const subjects = comparisonSubjects(demoTopic);
+    const subjectLabel = subjects.length >= 2 ? `${subjects[0]} and ${subjects[1]}` : String(demoTopic || "the compared options");
+    return [
+      `Demo sandbox comparison evidence for ${demoTopic || query}.`,
+      `${subjectLabel} should be compared by decision dimensions instead of a single winner claim.`,
+      "The useful dimensions are response speed, reasoning depth, visible output pace, cost and usage limits, workflow entry, repository context, multi-step reliability, and failure recovery.",
+      "A good analysis report should state a conclusion, cross-check each theme with at least two sources when possible, keep weak claims visible, and explain which user scenario fits each option.",
+      "When external tools are unavailable, the demo must label these sandbox observations explicitly instead of pretending they are live news sources."
+    ].join(" ");
+  }
   return [
     `Demo sandbox observation for ${query}.`,
     "A deep research style workflow should clarify the research intent, decompose subquestions, search across several source families, and keep a visible audit trail.",
@@ -380,6 +825,26 @@ function localEnvValue(name) {
 
 function tavilyApiKey(requestApiKey = "") {
   return requestApiKey || process.env.TAVILY_API_KEY || localEnvValue("TAVILY_API_KEY") || "";
+}
+
+function braveSearchApiKey(requestApiKey = "") {
+  return requestApiKey || process.env.BRAVE_SEARCH_API_KEY || localEnvValue("BRAVE_SEARCH_API_KEY") || "";
+}
+
+function firecrawlApiKey(requestApiKey = "") {
+  return requestApiKey || process.env.FIRECRAWL_API_KEY || localEnvValue("FIRECRAWL_API_KEY") || "";
+}
+
+function exaApiKey(requestApiKey = "") {
+  return requestApiKey || process.env.EXA_API_KEY || localEnvValue("EXA_API_KEY") || "";
+}
+
+function errorWithStatus(message, status) {
+  const error = new Error(message);
+  if (status) {
+    error.status = status;
+  }
+  return error;
 }
 
 function normalizeTavilyResult(result) {
@@ -424,7 +889,7 @@ async function searchTavily({ query, sourceBudget, tavilyApiKey: requestApiKey, 
     }
   }
   if (!response.ok) {
-    throw new Error(data?.error || data?.message || text || `Tavily HTTP ${response.status}`);
+    throw errorWithStatus(data?.error || data?.message || text || `Tavily HTTP ${response.status}`, response.status);
   }
   const items = (Array.isArray(data?.results) ? data.results : [])
     .map(normalizeTavilyResult)
@@ -443,6 +908,285 @@ async function searchTavily({ query, sourceBudget, tavilyApiKey: requestApiKey, 
       responseTime: data?.response_time ?? ""
     }
   };
+}
+
+function normalizeBraveResult(result) {
+  return {
+    title: String(result?.title || result?.url || "Untitled source"),
+    url: String(result?.url || ""),
+    text: String(result?.description || result?.extra_snippets?.join(" ") || ""),
+    rawContent: "",
+    score: undefined,
+    favicon: typeof result?.profile?.img === "string" ? result.profile.img : undefined
+  };
+}
+
+async function searchBrave({ query, sourceBudget, braveApiKey: requestApiKey, fetchImpl = fetch }) {
+  const apiKey = braveSearchApiKey(requestApiKey);
+  if (!apiKey) {
+    throw new Error("BRAVE_SEARCH_API_KEY is required for Brave search");
+  }
+  const url = new URL("https://api.search.brave.com/res/v1/web/search");
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(Math.min(20, Math.max(1, Number(sourceBudget) || 5))));
+  const response = await fetchImpl(url, {
+    headers: {
+      "X-Subscription-Token": apiKey
+    }
+  });
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { rawText: text };
+    }
+  }
+  if (!response.ok) {
+    throw errorWithStatus(data?.message || data?.error || text || `Brave Search HTTP ${response.status}`, response.status);
+  }
+  const items = (Array.isArray(data?.web?.results) ? data.web.results : [])
+    .map(normalizeBraveResult)
+    .filter((item) => item.url || item.text);
+  if (items.length === 0) {
+    throw new Error("Brave Search returned no usable results");
+  }
+  return {
+    summary: `Brave Search returned ${items.length} source candidates.`,
+    items,
+    toolAttributes: {
+      mode: "live",
+      provider: "brave"
+    }
+  };
+}
+
+function normalizeFirecrawlSearchResult(result) {
+  const metadata = result?.metadata ?? {};
+  return {
+    title: String(result?.title || metadata.title || result?.url || "Untitled source"),
+    url: String(result?.url || metadata.sourceURL || ""),
+    text: String(result?.description || result?.markdown || result?.content || ""),
+    rawContent: typeof result?.markdown === "string" ? result.markdown : "",
+    score: typeof result?.score === "number" ? result.score : undefined,
+    favicon: typeof metadata.favicon === "string" ? metadata.favicon : undefined
+  };
+}
+
+async function searchFirecrawl({ query, sourceBudget, firecrawlApiKey: requestApiKey, fetchImpl = fetch }) {
+  const apiKey = firecrawlApiKey(requestApiKey);
+  if (!apiKey) {
+    throw new Error("FIRECRAWL_API_KEY is required for Firecrawl search");
+  }
+  const response = await fetchImpl("https://api.firecrawl.dev/v2/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      query,
+      limit: Math.min(20, Math.max(1, Number(sourceBudget) || 5)),
+      scrapeOptions: { formats: ["markdown"] }
+    })
+  });
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { rawText: text };
+    }
+  }
+  if (!response.ok) {
+    throw errorWithStatus(data?.error || data?.message || text || `Firecrawl Search HTTP ${response.status}`, response.status);
+  }
+  const rawItems = Array.isArray(data?.data) ? data.data : Array.isArray(data?.results) ? data.results : [];
+  const items = rawItems.map(normalizeFirecrawlSearchResult).filter((item) => item.url || item.text);
+  if (items.length === 0) {
+    throw new Error("Firecrawl Search returned no usable results");
+  }
+  return {
+    summary: `Firecrawl Search returned ${items.length} source candidates.`,
+    items,
+    toolAttributes: {
+      mode: "live",
+      provider: "firecrawl"
+    }
+  };
+}
+
+function normalizeExaResult(result) {
+  const text = Array.isArray(result?.text)
+    ? result.text.join("\n")
+    : result?.text || result?.summary || result?.highlights?.join(" ") || "";
+  return {
+    title: String(result?.title || result?.url || "Untitled source"),
+    url: String(result?.url || ""),
+    text: String(text),
+    rawContent: String(text),
+    score: typeof result?.score === "number" ? result.score : undefined,
+    favicon: undefined
+  };
+}
+
+async function searchExa({ query, sourceBudget, exaApiKey: requestApiKey, fetchImpl = fetch }) {
+  const apiKey = exaApiKey(requestApiKey);
+  if (!apiKey) {
+    throw new Error("EXA_API_KEY is required for Exa search");
+  }
+  const response = await fetchImpl("https://api.exa.ai/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      query,
+      numResults: Math.min(20, Math.max(1, Number(sourceBudget) || 5)),
+      contents: { text: true }
+    })
+  });
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { rawText: text };
+    }
+  }
+  if (!response.ok) {
+    throw errorWithStatus(data?.error || data?.message || text || `Exa Search HTTP ${response.status}`, response.status);
+  }
+  const items = (Array.isArray(data?.results) ? data.results : [])
+    .map(normalizeExaResult)
+    .filter((item) => item.url || item.text);
+  if (items.length === 0) {
+    throw new Error("Exa Search returned no usable results");
+  }
+  return {
+    summary: `Exa Search returned ${items.length} source candidates.`,
+    items,
+    toolAttributes: {
+      mode: "live",
+      provider: "exa"
+    }
+  };
+}
+
+async function scrapeFirecrawl({ url, firecrawlApiKey: requestApiKey, fetchImpl = fetch }) {
+  const apiKey = firecrawlApiKey(requestApiKey);
+  if (!apiKey) {
+    throw new Error("FIRECRAWL_API_KEY is required for Firecrawl scrape");
+  }
+  const response = await fetchImpl("https://api.firecrawl.dev/v2/scrape", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({ url, formats: ["markdown"] })
+  });
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { rawText: text };
+    }
+  }
+  if (!response.ok) {
+    throw errorWithStatus(data?.error || data?.message || text || `Firecrawl Scrape HTTP ${response.status}`, response.status);
+  }
+  const markdown = data?.data?.markdown || data?.markdown || data?.content || "";
+  if (!String(markdown).trim()) {
+    throw new Error("Firecrawl Scrape returned empty content");
+  }
+  return {
+    summary: "Firecrawl scrape returned markdown content.",
+    text: String(markdown).slice(0, 2400),
+    toolAttributes: { provider: "firecrawl" }
+  };
+}
+
+async function searchLiveWithProviders(input, options = {}) {
+  const attempts = [
+    ["tavily", () => searchTavily(input)],
+    ["brave", () => searchBrave(input)],
+    ["firecrawl", () => searchFirecrawl(input)]
+  ];
+  const errors = [];
+  for (const [provider, execute] of attempts) {
+    try {
+      const result = await execute();
+      return {
+        ...result,
+        summary: `${result.summary} Provider chain: ${[...errors.map((item) => `${item.provider}:failed`), `${provider}:ok`].join(" -> ")}.`,
+        toolAttributes: {
+          ...result.toolAttributes,
+          providerChain: [...errors.map((item) => `${item.provider}:failed`), `${provider}:ok`].join(" -> ")
+        }
+      };
+    } catch (error) {
+      errors.push({ provider, error: error instanceof Error ? error.message : "Unknown search failure" });
+    }
+  }
+  const missing = "TAVILY_API_KEY, BRAVE_SEARCH_API_KEY, or FIRECRAWL_API_KEY is required for Live search";
+  const detail = errors.map((item) => `${item.provider}: ${item.error}`).join("; ");
+  throw new Error(detail ? `${missing}. Attempts: ${detail}` : missing);
+}
+
+async function invokeAllowlistedMcp(input, { run }) {
+  const tool = String(input?.tool || input?.name || "");
+  const payload = input?.input && typeof input.input === "object" ? input.input : input;
+  const common = {
+    query: String(payload?.query || run.meta.question),
+    sourceBudget: payload?.sourceBudget ?? run.meta.sourceBudget,
+    tavilyApiKey: run.tavilyApiKey,
+    braveApiKey: run.braveApiKey,
+    firecrawlApiKey: run.firecrawlApiKey,
+    exaApiKey: run.exaApiKey,
+    fetchImpl: run.fetchImpl
+  };
+  try {
+    let result;
+    if (tool === "tavily.search") {
+      result = await searchTavily(common);
+    } else if (tool === "firecrawl.search") {
+      result = await searchFirecrawl(common);
+    } else if (tool === "firecrawl.scrape") {
+      result = await scrapeFirecrawl({
+        url: String(payload?.url || ""),
+        firecrawlApiKey: run.firecrawlApiKey,
+        fetchImpl: run.fetchImpl
+      });
+    } else if (tool === "exa.search") {
+      result = await searchExa(common);
+    } else {
+      throw new Error(`MCP tool is not allowlisted: ${tool || "unknown"}`);
+    }
+    recordMcpAudit(run, {
+      mcpTool: tool,
+      status: "succeeded",
+      provider: result.toolAttributes?.provider || tool.split(".")[0],
+      input,
+      outputSummary: result.summary
+    });
+    return result;
+  } catch (error) {
+    recordMcpAudit(run, {
+      mcpTool: tool || "unknown",
+      status: "failed",
+      provider: tool.split(".")[0],
+      input,
+      error: error instanceof Error ? error.message : "Unknown MCP failure"
+    });
+    throw error;
+  }
 }
 
 function demoProviderResult(run, evidenceNodes, mode) {
@@ -535,10 +1279,12 @@ async function searchWeb(query, options = {}) {
   const searchQuery = typeof query === "string" ? query : query.query;
   const allowDemoFallback = Boolean(typeof query === "object" && query.allowDemoFallback);
   if (query?.runMode === "live") {
-    return searchTavily({
+    return searchLiveWithProviders({
       query: searchQuery,
       sourceBudget: query.sourceBudget,
       tavilyApiKey: query.tavilyApiKey,
+      braveApiKey: query.braveApiKey,
+      firecrawlApiKey: query.firecrawlApiKey,
       fetchImpl: options.fetchImpl
     });
   }
@@ -602,6 +1348,12 @@ async function searchWeb(query, options = {}) {
 }
 
 async function fetchPage(url, options = {}) {
+  if (String(options.rawContent || "").trim().length > 80) {
+    return {
+      summary: "使用搜索 provider 返回的 raw content 作为正文来源。",
+      text: String(options.rawContent).slice(0, 2400)
+    };
+  }
   if (!url) {
     if (options.allowDemoFallback) {
       return {
@@ -616,6 +1368,17 @@ async function fetchPage(url, options = {}) {
       summary: "Demo sandbox 读取内置网页片段。",
       text: demoFetchedText(options.query ?? url)
     };
+  }
+  if (options.firecrawlApiKey) {
+    try {
+      return await scrapeFirecrawl({
+        url,
+        firecrawlApiKey: options.firecrawlApiKey,
+        fetchImpl: options.fetchImpl
+      });
+    } catch {
+      // Firecrawl is a scrape fallback; native fetch still gets a chance below.
+    }
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 9000);
@@ -831,15 +1594,211 @@ function sourceBasis(source) {
   return compactText(source.fetchedText || source.rawContent || source.snippet || source.title, 180);
 }
 
+function fullSourceText(source) {
+  return String([source.title, source.snippet, source.rawContent, source.fetchedText].filter(Boolean).join(" "));
+}
+
+function isComparisonQuestion(question) {
+  return /对比|比较|\bvs\b|\bversus\b|compare|comparison|和.+区别|与.+区别/i.test(String(question || ""));
+}
+
+function comparisonSubjects(question) {
+  const text = String(question || "")
+    .replace(/请|帮我|对比一下|对比|比较一下|比较|compare|comparison|一下|：|:/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const parts = text
+    .split(/\s+(?:vs|versus|and)\s+|和|与|、|,/i)
+    .map((part) => compactText(part, 28))
+    .filter((part) => part.length >= 2 && !/区别|差异|哪个|怎么选|如何选择/.test(part));
+  return parts.slice(0, 3);
+}
+
+const comparisonThemes = [
+  {
+    label: "速度与响应节奏",
+    keywords: ["速度", "响应", "快", "慢", "推理时间", "输出", "latency", "speed", "token"],
+    claim: "速度与响应节奏决定短任务体感，但需要区分首响速度、推理深度和可见输出速度"
+  },
+  {
+    label: "成本与额度约束",
+    keywords: ["价格", "成本", "额度", "付费", "pro", "usage", "limit", "quota", "cost"],
+    claim: "成本与额度约束会影响高频工程使用，不能只看单次生成质量"
+  },
+  {
+    label: "工作流与入口适配",
+    keywords: ["workflow", "工作流", "插件", "cli", "分支", "入口", "terminal", "终端", "ide"],
+    claim: "工作流入口和分支能力决定工具能否融入真实开发节奏"
+  },
+  {
+    label: "复杂工程与上下文能力",
+    keywords: ["上下文", "subagent", "子代理", "复杂", "工程", "repo", "仓库", "multi-agent"],
+    claim: "复杂工程任务更依赖上下文保持、任务拆分和多步骤执行稳定性"
+  },
+  {
+    label: "可靠性与不确定性",
+    keywords: ["限制", "风险", "不确定", "错误", "稳定", "失败", "反例", "hallucination"],
+    claim: "可靠性差异主要体现在长链路任务失败、限制和反例处理上"
+  },
+  {
+    label: "适用人群与选择建议",
+    keywords: ["适合", "选择", "推荐", "场景", "用户", "开发者", "builder", "team"],
+    claim: "最终选择应按任务场景和团队约束分层，而不是抽象判断谁绝对更强"
+  }
+];
+
+const generalThemes = [
+  {
+    label: "需求与适用场景",
+    keywords: ["需求", "用户", "场景", "目标", "痛点", "市场"],
+    claim: "需求成立的关键在于目标用户、使用场景和替代方案是否清楚"
+  },
+  {
+    label: "经济性与运营约束",
+    keywords: ["成本", "价格", "收入", "租金", "运营", "商业化", "roi"],
+    claim: "经济性需要同时看成本结构、收入假设和运营约束"
+  },
+  {
+    label: "执行路径与资源配置",
+    keywords: ["路径", "落地", "执行", "资源", "团队", "流程", "供应链"],
+    claim: "落地路径需要把关键资源、实施步骤和验证节奏拆开判断"
+  },
+  {
+    label: "风险、反例与边界条件",
+    keywords: ["风险", "限制", "失败", "监管", "不确定", "反例", "边界"],
+    claim: "风险与边界条件必须进入结论，否则报告会把搜索结果误读成确定判断"
+  },
+  {
+    label: "数据与证据强度",
+    keywords: ["数据", "案例", "证据", "调研", "验证", "报告", "来源"],
+    claim: "证据强度决定结论能否从观点升级为可执行判断"
+  }
+];
+
+function pickTheme(question, source, index) {
+  const themes = isComparisonQuestion(question) ? comparisonThemes : generalThemes;
+  const text = fullSourceText(source).toLowerCase();
+  const scored = themes.map((theme, themeIndex) => ({
+    theme,
+    score: theme.keywords.reduce((sum, keyword) => sum + (text.includes(keyword.toLowerCase()) ? 1 : 0), 0),
+    themeIndex
+  })).sort((left, right) => right.score - left.score || left.themeIndex - right.themeIndex);
+  if (scored[0]?.score > 0) {
+    return scored[0].theme;
+  }
+  return themes[index % themes.length];
+}
+
 function researchClaimForSource(question, source, index) {
   const topic = topicLabel(question, 34);
-  const angles = [
-    "核心用户目标与评价标准",
-    "可用证据与代表性来源",
-    "风险、反例与不确定性",
-    "结论呈现与可追溯结构"
-  ];
-  return `${topic}：${angles[index % angles.length]}`;
+  const theme = pickTheme(question, source, index);
+  return `${topic}：${theme.claim}`;
+}
+
+function evidenceById(evidenceCards) {
+  return new Map((evidenceCards ?? []).map((card) => [card.id, card]));
+}
+
+function sourcesForClaim(claim, evidenceMap) {
+  return (claim.evidenceIds ?? [])
+    .map((id) => evidenceMap.get(id))
+    .filter(Boolean);
+}
+
+function claimEvidenceQuote(claim, evidenceMap) {
+  const cards = sourcesForClaim(claim, evidenceMap);
+  return cards
+    .slice(0, 2)
+    .map((card) => `《${compactText(card.title || card.source, 28)}》提到：${compactText(card.quote, 96)}`)
+    .join("；");
+}
+
+function sourceTitlesForClaim(claim, evidenceMap) {
+  return [...new Set(sourcesForClaim(claim, evidenceMap).map((card) => card.source || card.title).filter(Boolean))].slice(0, 3);
+}
+
+function buildComparisonMatrix({ question, claims, evidenceMap }) {
+  const subjects = comparisonSubjects(question);
+  const subjectLabel = subjects.length >= 2 ? `${subjects[0]} / ${subjects[1]}` : "待比较对象";
+  return claims.slice(0, 6).map((claim) => {
+    const quote = claimEvidenceQuote(claim, evidenceMap) || "当前来源只提供片段信号，需要更多一手材料复核。";
+    return {
+      dimension: compactText(claim.claim.replace(`${topicLabel(question, 34)}：`, ""), 34),
+      comparison: `${subjectLabel} 在该维度不能用单一胜负概括，应按任务场景比较。`,
+      evidence: quote,
+      status: claim.status,
+      supportCount: claim.supportCount,
+      confidence: claim.confidence.toFixed(2)
+    };
+  });
+}
+
+export function buildAnalyticalSynthesis({ question, scope, sources, evidenceCards, verification }) {
+  const topic = topicLabel(question);
+  const evidenceMap = evidenceById(evidenceCards);
+  const claims = (verification.claims ?? []).slice().sort((left, right) => {
+    const statusScore = { verified: 3, conflicted: 2, weak: 1 };
+    return (statusScore[right.status] ?? 0) - (statusScore[left.status] ?? 0)
+      || right.supportCount - left.supportCount
+      || right.confidence - left.confidence;
+  });
+  const verifiedClaims = claims.filter((claim) => claim.status === "verified");
+  const weakClaims = claims.filter((claim) => claim.status !== "verified");
+  const topClaims = claims.slice(0, 5);
+  const subjects = comparisonSubjects(question);
+  const comparison = isComparisonQuestion(question);
+  const topSources = (sources ?? []).slice(0, 4).map((source) => source.title).filter(Boolean);
+  const strongest = topClaims[0];
+  const primaryEvidence = strongest ? claimEvidenceQuote(strongest, evidenceMap) : "";
+  const conclusion = comparison
+    ? `结论：${subjects.length >= 2 ? `${subjects[0]} 和 ${subjects[1]}` : topic} 不应被写成“谁绝对更好”。从已收集来源看，真正影响选择的是速度/成本、工作流入口、复杂工程上下文和可靠性边界；其中 ${verifiedClaims.length} 个主题达到多来源支撑，${weakClaims.length} 个主题仍需要保留不确定性。`
+    : `结论：围绕“${topic}”的判断应从需求、经济性、执行路径和风险边界同时展开。当前 ${verifiedClaims.length} 个主题达到多来源支撑，${weakClaims.length} 个主题需要继续补证。`;
+  const thesis = primaryEvidence
+    ? `${conclusion}\n\n最强证据链来自：${primaryEvidence}`
+    : conclusion;
+  const themes = topClaims.map((claim, index) => ({
+    id: claim.id,
+    title: `${index + 1}. ${compactText(claim.claim.replace(`${topicLabel(question, 34)}：`, ""), 48)}`,
+    status: claim.status,
+    supportCount: claim.supportCount,
+    confidence: claim.confidence,
+    evidence: sourcesForClaim(claim, evidenceMap),
+    sourceTitles: sourceTitlesForClaim(claim, evidenceMap),
+    body: [
+      `判断：${claim.claim}`,
+      `证据：${claimEvidenceQuote(claim, evidenceMap) || "当前只有弱片段，不能当作强结论。"}`,
+      `解释：该主题的状态是 ${claim.status}，来自 ${claim.supportCount} 个独立来源；报告应把它作为${claim.status === "verified" ? "主要结论" : "待复核信号"}处理。`
+    ].join("\n")
+  }));
+  const matrixRows = comparison ? buildComparisonMatrix({ question, claims: topClaims, evidenceMap }) : topClaims.map((claim) => ({
+    dimension: compactText(claim.claim.replace(`${topicLabel(question, 34)}：`, ""), 34),
+    finding: claimEvidenceQuote(claim, evidenceMap) || claim.claim,
+    status: claim.status,
+    supportCount: claim.supportCount,
+    confidence: claim.confidence.toFixed(2)
+  }));
+  const recommendation = comparison
+    ? `建议：如果任务更偏短周期生成、预算/额度敏感和快速试错，优先比较速度与成本维度；如果任务更偏长链路工程、仓库上下文和多步骤执行，优先比较工作流、上下文保持和失败恢复能力。不要只看单篇评测或单次 demo，应把同一任务分别跑在候选工具上，用相同验收标准记录耗时、返工次数、上下文丢失和最终可用代码。`
+    : `建议：先把“${topic}”拆成可验证假设，再用来源矩阵区分强证据、弱证据和反例。下一步应补充一手数据、成本测算或真实案例，避免把搜索摘要直接当成结论。`;
+  const limitations = [
+    `来源预算限制在 ${(sources ?? []).length} 个，搜索结果会受 provider、抓取成功率和网页可读性影响。`,
+    weakClaims.length > 0 ? `弱/冲突主题包括：${weakClaims.slice(0, 3).map((claim) => compactText(claim.claim, 44)).join("；")}。` : "当前没有显式冲突主题，但这不等于不存在反例。",
+    "本报告只使用本次 run 已收集来源，不臆造未抓取的一手 benchmark。"
+  ].join(" ");
+  return {
+    topic,
+    comparison,
+    subjects,
+    thesis,
+    executiveSummary: thesis,
+    themes,
+    matrixRows,
+    recommendation,
+    limitations,
+    topSources,
+    verifiedCount: verifiedClaims.length,
+    weakCount: weakClaims.length
+  };
 }
 
 export function createResearchPlan({ question, scope, sourceBudget = DEFAULT_SOURCE_BUDGET }) {
@@ -933,6 +1892,19 @@ export function extractEvidenceCards({ question, rankedSources }) {
       capturedAt: now()
     };
   });
+  const uniqueClaims = new Set(cards.map((card) => card.claim));
+  if (cards.length >= 4 && uniqueClaims.size < 4) {
+    const themes = isComparisonQuestion(question) ? comparisonThemes : generalThemes;
+    cards.forEach((card, index) => {
+      const theme = themes[index % themes.length];
+      const claim = `${topicLabel(question, 34)}：${theme.claim}`;
+      card.claim = claim;
+      card.supports = [claim];
+      if (card.contradicts?.length) {
+        card.contradicts = [claim];
+      }
+    });
+  }
   return {
     summary: `已围绕“${topicLabel(question)}”抽取 ${cards.length} 张 evidence card，覆盖 ${new Set(cards.map((card) => card.claim)).size} 个主题结论。`,
     items: cards
@@ -983,8 +1955,8 @@ export function findResearchCases(claims) {
   const examples = (claims ?? []).slice(0, 4).map((claim, index) => ({
     id: `example-${index + 1}`,
     claimId: claim.id,
-    title: `案例 ${index + 1}：${compactText(claim.claim, 28)}`,
-    body: `当用户阅读“${claim.claim}”时，界面应展示支撑来源、验证状态和报告章节的回链；如果该结论是 ${claim.status}，报告需要同步说明依据数量和不确定性。`
+    title: `证据主题 ${index + 1}：${compactText(claim.claim, 30)}`,
+    body: `该主题当前是 ${claim.status}，由 ${claim.supportCount} 个来源支撑。报告正文应说明它反映的问题、适用场景和不确定性，而不是只列出搜索结果。`
   }));
   return {
     summary: `已为 ${examples.length} 个结论补充具体案例。`,
@@ -992,22 +1964,27 @@ export function findResearchCases(claims) {
   };
 }
 
-export function planVisualizations({ question, claims, sources }) {
+export function planVisualizations({ question, claims, sources, evidenceCards = [] }) {
   const topic = topicLabel(question, 28);
   const mermaidLines = [
     "flowchart LR",
-    `  Plan[${topic} 研究计划] --> Search[主题检索分支]`,
-    "  Search --> Sources[8-12 个主题来源]",
-    "  Sources --> Evidence[主题 Evidence Cards]",
-    "  Evidence --> Verify[来源交叉验证]",
+    `  Intent[${topic} 课题] --> Plan[研究计划与问题树]`,
+    "  Plan --> Search[4 条搜索分支]",
+    "  Search --> Sources[8-12 个候选来源]",
+    "  Sources --> Fetch[网页抓取 / 失败可降级]",
+    "  Fetch --> Rank[来源质量排序]",
+    "  Rank --> Evidence[Evidence Cards]",
+    "  Evidence --> Verify[交叉验证]",
     "  Verify --> Claims[Verified / Weak / Conflicted Claims]",
-    "  Claims --> Report[结构化报告]"
+    "  Claims --> Visuals[来源矩阵与 Claim Graph]",
+    "  Visuals --> Report[结构化报告章节]"
   ];
   const graphEdges = (claims ?? []).flatMap((claim) => claim.evidenceIds.slice(0, 3).map((evidenceId) => ({
     from: evidenceId,
     to: claim.id,
     kind: claim.status === "conflicted" ? "contradicts" : "supports"
   })));
+  const evidenceMap = evidenceById(evidenceCards);
   return {
     summary: `已为“${topic}”生成 evidence matrix 和 claim-support graph 可视化规格。`,
     blocks: [
@@ -1041,6 +2018,22 @@ export function planVisualizations({ question, claims, sources }) {
           ...(sources ?? []).slice(0, 8).map((source) => ({ id: source.id, label: source.title, kind: "source" }))
         ],
         edges: graphEdges,
+        claims: (claims ?? []).map((claim) => ({
+          id: claim.id,
+          label: claim.claim,
+          status: claim.status,
+          supportCount: claim.supportCount,
+          confidence: Number(claim.confidence.toFixed(2)),
+          evidenceIds: claim.evidenceIds ?? [],
+          sourceTitles: sourceTitlesForClaim(claim, evidenceMap)
+        })),
+        evidence: (evidenceCards ?? []).map((card) => ({
+          id: card.id,
+          title: card.title,
+          sourceId: card.sourceId,
+          sourceTitle: card.source || card.title,
+          quote: compactText(card.quote, 160)
+        })),
         sourceNodeIds: [...new Set(graphEdges.flatMap((edge) => [edge.from, edge.to]))]
       }
     ]
@@ -1053,69 +2046,91 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
   const allEvidenceIds = evidenceCards.map((card) => card.id);
   const allSourceIds = sources.map((source) => source.id);
   const topic = topicLabel(run.meta.question);
-  const topSources = sources.slice(0, 3).map((source) => source.title).join("、") || "暂无来源";
-  const keyFindings = verification.claims
-    .slice(0, 4)
-    .map((claim) => `“${claim.claim}”是 ${claim.status} 结论，来自 ${claim.supportCount} 个来源。`)
-    .join(" ");
+  const synthesis = buildAnalyticalSynthesis({
+    question: run.meta.question,
+    scope: run.meta.scope,
+    sources,
+    evidenceCards,
+    verification
+  });
+  const topSources = synthesis.topSources.join("、") || "暂无来源";
+  const themeBodies = synthesis.themes.map((theme) => [
+    `### ${theme.title}`,
+    theme.body,
+    theme.sourceTitles.length > 0 ? `代表来源：${theme.sourceTitles.join("、")}` : "代表来源：本次来源片段不足，需要补充一手材料。"
+  ].join("\n")).join("\n\n");
+  const matrixMarkdown = synthesis.matrixRows.map((row) => {
+    if (synthesis.comparison) {
+      return `- ${row.dimension}：${row.comparison} 证据：${row.evidence}（${row.status}，${row.supportCount} 个来源，confidence ${row.confidence}）`;
+    }
+    return `- ${row.dimension}：${row.finding}（${row.status}，${row.supportCount} 个来源，confidence ${row.confidence}）`;
+  }).join("\n");
   const reportBody = [
-    `本报告围绕“${run.meta.question}”生成，范围是“${run.meta.scope}”。`,
-    `过程图谱共纳入 ${sources.length} 个来源、${evidenceCards.length} 张 evidence card、${verification.claims.length} 个主题结论，其中 ${verifiedClaims.length} 个 verified、${weakClaims.length} 个 weak/conflicted。`,
-    `首要来源包括：${topSources}。结构化内容包含执行摘要、交叉验证矩阵、来源质量矩阵、claim-support graph 和章节正文。`
+    synthesis.thesis,
+    `本次 run 纳入 ${sources.length} 个来源、${evidenceCards.length} 张 evidence card、${verification.claims.length} 个主题结论，其中 ${verifiedClaims.length} 个 verified、${weakClaims.length} 个 weak/conflicted。`,
+    `首要来源包括：${topSources}。报告优先给出分析结论，来源矩阵和 Claim Graph 只用于追溯证据。`
   ].join("\n\n");
   let sections = [
     {
       id: "section-summary",
-      title: `一、${topic}：摘要`,
-      body: `本次 demo deep research 围绕“${run.meta.question}”执行计划、分支检索、来源读取、证据抽取、交叉验证、案例补充和结构化报告写作。当前纳入 ${sources.length} 个来源，形成 ${verification.claims.length} 个主题结论；${verifiedClaims.length} 个达到多来源验证，${weakClaims.length} 个需要在报告中标记为弱证据或冲突信号。`,
+      title: `一、${topic}：执行结论`,
+      body: synthesis.executiveSummary,
       sourceNodeIds: ["research-plan", ...verification.claims.map((claim) => claim.id).slice(0, 3)]
     },
     {
-      id: "section-method",
-      title: "二、研究方法与节点依据",
-      body: `研究计划把“${run.meta.question}”拆成 ${plan.researchQuestions.length} 个问题和 ${plan.searchQueries.length} 条搜索分支。每个来源先进入 source node，再抽取 evidence card，最后通过 cross_check 判断 verified、weak 或 conflicted；因此用户点击任一结论时，都能回到支撑来源、证据片段和验证状态。`,
-      sourceNodeIds: ["research-plan", ...plan.searchQueries.map((_, index) => `query-${index + 1}`)]
-    },
-    {
-      id: "section-source-quality",
-      title: "三、来源质量说明",
-      body: `围绕“${topic}”的来源按完整文本、独立性、类型覆盖和排序质量打分。sandbox 来源会被明确标记，避免把 demo fallback 伪装成真实外部研究；来源矩阵优先展示 rank、title、type、quality 和 independence，帮助用户判断哪些依据更可靠。`,
-      sourceNodeIds: allSourceIds.slice(0, 8)
-    },
-    {
       id: "section-findings",
-      title: "四、核心发现",
-      body: keyFindings || `当前“${topic}”没有达到多来源验证的结论，报告应降级展示，并把证据不足显式暴露给用户。`,
-      sourceNodeIds: [...verification.claims.map((claim) => claim.id), ...allEvidenceIds.slice(0, 4)]
+      title: synthesis.comparison ? "二、核心对比结论" : "二、核心分析结论",
+      body: themeBodies || `当前“${topic}”没有达到多来源验证的主题结论，报告应降级展示，并把证据不足显式暴露给用户。`,
+      sourceNodeIds: [...verification.claims.map((claim) => claim.id), ...allEvidenceIds.slice(0, 6)]
+    },
+    {
+      id: "section-comparison-matrix",
+      title: synthesis.comparison ? "三、对比矩阵与证据解释" : "三、证据矩阵与解释",
+      body: matrixMarkdown || "当前没有足够矩阵数据。",
+      sourceNodeIds: [...verification.claims.map((claim) => claim.id), ...allEvidenceIds.slice(0, 8)]
     },
     {
       id: "section-cross-check",
-      title: "五、交叉验证矩阵",
-      body: `“${topic}”的交叉验证结果：${verifiedClaims.length} 个 verified claim，${weakClaims.length} 个 weak/conflicted claim。弱证据结论保留在报告中，但明确标记为需要更多来源；冲突信号不会被吞掉，而是保留为 counterclaim 或弱结论说明。`,
+      title: "四、交叉验证与证据强度",
+      body: [
+        `本次交叉验证得到 ${verifiedClaims.length} 个 verified claim、${weakClaims.length} 个 weak/conflicted claim。`,
+        `verified 主题可作为主要结论；weak/conflicted 主题只能作为风险提示或待补证假设。`,
+        weakClaims.length > 0 ? `需要谨慎阅读的主题：${weakClaims.slice(0, 4).map((claim) => compactText(claim.claim, 54)).join("；")}。` : "当前没有显式冲突主题，但仍需避免把搜索摘要当成 benchmark。"
+      ].join("\n\n"),
       sourceNodeIds: verification.claims.map((claim) => claim.id)
     },
     {
+      id: "section-problems",
+      title: "五、反映的问题与风险",
+      body: [
+        `这批来源反映的核心问题不是“资料够不够多”，而是结论是否能被多来源相互印证。`,
+        synthesis.limitations,
+        `如果后续要把“${run.meta.question}”变成可执行决策，应补充一手测试、相同任务 benchmark、失败样本和成本记录。`
+      ].join("\n\n"),
+      sourceNodeIds: [...weakClaims.map((claim) => claim.id), ...allSourceIds.slice(0, 4)]
+    },
+    {
       id: "section-examples",
-      title: "六、案例与例子",
-      body: examples.map((item) => `${item.title}：${item.body}`).join(" ") || `当前“${topic}”还没有足够案例节点，建议继续补充真实来源。`,
+      title: "六、案例化解读",
+      body: examples.map((item) => `${item.title}：${item.body}`).join("\n\n") || `当前“${topic}”还没有足够案例节点，建议继续补充真实来源。`,
       sourceNodeIds: examples.map((item) => item.id)
     },
     {
       id: "section-visualization",
-      title: "七、可视化结构图",
-      body: `报告为“${topic}”生成执行链路、来源质量矩阵和 claim-support graph，让读者先看结构，再追溯具体证据。可视化节点不替代结论，而是解释每条结论从哪个来源、证据和验证结果生长出来。`,
+      title: "七、可视化如何辅助阅读",
+      body: `来源质量矩阵用于判断来源可靠性，Claim Graph 用于追溯“结论—证据—来源”的关系。它们不替代正文结论，只帮助读者检查每个主题结论从哪里来、是否有多来源支撑。`,
       sourceNodeIds: visualizations.blocks.flatMap((block) => block.sourceNodeIds ?? []).slice(0, 10)
     },
     {
       id: "section-recommendations",
-      title: "八、结论与建议",
-      body: `围绕“${run.meta.question}”，界面应把计划节点、来源节点、证据节点、验证节点和报告章节连成可追溯链路：计划解释为什么搜，来源解释搜到了什么，验证解释哪些结论可信，报告解释最终如何写成可交付物。用户看到的节点描述必须优先说明依据和作用，而不是暴露内部流程名。`,
+      title: "八、选择建议与下一步",
+      body: synthesis.recommendation,
       sourceNodeIds: ["research-plan", ...verification.claims.map((claim) => claim.id)]
     },
     {
       id: "section-limitations",
       title: "九、局限性",
-      body: `这仍是 demo 级深研：为了稳定性和时延，“${topic}”的来源预算被限制在 12 个以内，sandbox fallback 会显式标记。未来可接入后台队列、数据库和更多工具扩大研究深度，但不能用更复杂的内核换来更含糊的用户表达。`,
+      body: synthesis.limitations,
       sourceNodeIds: ["research-plan", ...weakClaims.map((claim) => claim.id)]
     }
   ].map((section) => ({
@@ -1128,6 +2143,7 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
     provider: run.meta.runMode === "live" ? run.providerConfig.protocol : "deterministic",
     model: run.providerConfig.model
   };
+  let providerFallbackLog = null;
   if (run.meta.runMode === "live") {
     const availableSourceNodeIds = [
       "research-plan",
@@ -1137,54 +2153,89 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
       ...verification.claims.map((claim) => claim.id),
       ...examples.map((example) => example.id)
     ];
-    const providerResult = await callProvider(run.providerConfig, [
-      {
-        role: "system",
-        content: [
-          "You are the Loading Mind live report writer.",
-          "Return only JSON with this shape: {\"summary\":\"...\",\"sections\":[{\"id\":\"section-summary\",\"title\":\"...\",\"body\":\"...\",\"sourceNodeIds\":[\"...\"]}]}",
-          "Use only availableSourceNodeIds for sourceNodeIds."
-        ].join("\n")
-      },
-      {
-        role: "user",
-        content: JSON.stringify({
-          question: run.meta.question,
-          scope: run.meta.scope,
-          plan,
-          sources: sources.map((source) => ({ id: source.id, title: source.title, url: source.url, text: source.text })),
-          evidence: evidenceCards,
-          verification,
-          examples,
-          availableSourceNodeIds,
-          requirement: "Write 5 concise Chinese report sections grounded in the supplied live sources."
-        }, null, 2)
-      }
-    ], {
-      fetchImpl: run.fetchImpl
-    });
-    if (providerResult.sections?.length) {
-      sections = providerResult.sections.slice(0, 5).map((section, index) => {
-        const sourceNodeIds = (section.sourceNodeIds ?? []).filter((nodeId) => availableSourceNodeIds.includes(nodeId));
-        return {
-          id: section.id || `section-live-${index + 1}`,
-          title: section.title || `Live section ${index + 1}`,
-          body: section.body,
-          sourceNodeIds: sourceNodeIds.length > 0 ? sourceNodeIds : availableSourceNodeIds.slice(0, 4)
-        };
+    try {
+      const providerResult = await callProvider(run.providerConfig, [
+        {
+          role: "system",
+          content: [
+            "You are the Loading Mind live report writer.",
+            "Return only JSON with this shape: {\"summary\":\"...\",\"sections\":[{\"id\":\"section-summary\",\"title\":\"...\",\"body\":\"...\",\"sourceNodeIds\":[\"...\"]}]}",
+            "Write an analytical report article, not a list of search results.",
+            "Every report must include a clear conclusion, evidence-backed themes, comparison/decision matrix when relevant, risks, recommendations, and limitations.",
+            "Use only availableSourceNodeIds for sourceNodeIds."
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            question: run.meta.question,
+            scope: run.meta.scope,
+            plan,
+            synthesis,
+            sources: sources.map((source) => ({ id: source.id, title: source.title, url: source.url, text: source.fetchedText || source.rawContent || source.snippet })),
+            evidence: evidenceCards,
+            verification,
+            examples,
+            availableSourceNodeIds,
+            requirement: "Write 6-8 concise Chinese report sections as a real analysis article. Cross-validate sources before stating conclusions. Do not describe internal tool workflow unless it explains evidence quality."
+          }, null, 2)
+        }
+      ], {
+        fetchImpl: run.fetchImpl
       });
+      if (providerResult.sections?.length) {
+        sections = providerResult.sections.slice(0, 5).map((section, index) => {
+          const sourceNodeIds = (section.sourceNodeIds ?? []).filter((nodeId) => availableSourceNodeIds.includes(nodeId));
+          return {
+            id: section.id || `section-live-${index + 1}`,
+            title: section.title || `Live section ${index + 1}`,
+            body: section.body,
+            sourceNodeIds: sourceNodeIds.length > 0 ? sourceNodeIds : availableSourceNodeIds.slice(0, 4)
+          };
+        });
+      }
+      providerAttributes = {
+        mode: "live",
+        provider: run.providerConfig.protocol,
+        model: providerResult.discoveredModel || run.providerConfig.model,
+        latencyMs: providerResult.latencyMs ?? "",
+        format: providerResult.format || "json",
+        ...(providerResult.parseError ? { parseError: providerResult.parseError } : {})
+      };
+    } catch (error) {
+      providerFallbackLog = recordRunError(run, error, {
+        phase: "drafting",
+        toolName: "report_write",
+        provider: run.providerConfig.protocol,
+        input: {
+          question: run.meta.question,
+          sourceCount: sources.length,
+          evidenceCount: evidenceCards.length,
+          claimCount: verification.claims.length
+        }
+      });
+      providerAttributes = {
+        mode: "live",
+        provider: "deterministic_fallback",
+        model: run.providerConfig.model,
+        fallbackReason: providerFallbackLog.message,
+        fallbackErrorType: providerFallbackLog.errorType
+      };
     }
-    providerAttributes = {
-      mode: "live",
-      provider: run.providerConfig.protocol,
-      model: providerResult.discoveredModel || run.providerConfig.model,
-      latencyMs: providerResult.latencyMs ?? "",
-      format: providerResult.format || "json",
-      ...(providerResult.parseError ? { parseError: providerResult.parseError } : {})
-    };
   }
 
   const blocks = [
+    ...(providerFallbackLog ? [{
+      id: "block-provider-fallback",
+      type: "markdown",
+      title: "Live provider fallback",
+      body: [
+        "Live LLM provider failed during report writing, so Loading Mind completed the report from already collected live sources, evidence cards, and verification results.",
+        `Error type: ${providerFallbackLog.errorType}.`,
+        `Next action: ${providerFallbackLog.nextAction}`
+      ].join("\n\n"),
+      sourceNodeIds: ["research-plan", ...verification.claims.map((claim) => claim.id).slice(0, 3)]
+    }] : []),
     {
       id: "block-executive-summary",
       type: "markdown",
@@ -1195,14 +2246,9 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
     {
       id: "block-verification-table",
       type: "table",
-      title: "交叉验证矩阵",
-      columns: ["claim", "status", "supportCount", "confidence"],
-      rows: verification.claims.map((claim) => ({
-        claim: claim.claim,
-        status: claim.status,
-        supportCount: claim.supportCount,
-        confidence: claim.confidence.toFixed(2)
-      })),
+      title: synthesis.comparison ? "对比与交叉验证矩阵" : "证据交叉验证矩阵",
+      columns: synthesis.comparison ? ["dimension", "comparison", "status", "supportCount", "confidence"] : ["dimension", "finding", "status", "supportCount", "confidence"],
+      rows: synthesis.matrixRows,
       sourceNodeIds: verification.claims.map((claim) => claim.id)
     },
     ...visualizations.blocks,
@@ -1243,6 +2289,8 @@ export function createDefaultToolRegistry() {
         runMode: run.meta.runMode,
         sourceBudget: run.meta.sourceBudget,
         tavilyApiKey: run.tavilyApiKey,
+        braveApiKey: run.braveApiKey,
+        firecrawlApiKey: run.firecrawlApiKey,
         allowDemoFallback: run.allowDemoFallback,
         forceDemoTools: run.forceDemoTools
       }, {
@@ -1261,8 +2309,10 @@ export function createDefaultToolRegistry() {
       phase: "graph_build",
       cluster: "sources",
       failurePolicy: "record",
-      execute: ({ url, query }, { run }) => fetchPage(url, {
+      execute: ({ url, query, rawContent }, { run }) => fetchPage(url, {
         query,
+        rawContent,
+        firecrawlApiKey: run.firecrawlApiKey,
         allowDemoFallback: run.allowDemoFallback,
         forceDemoTools: run.forceDemoTools,
         fetchImpl: run.fetchImpl
@@ -1311,7 +2361,7 @@ export function createDefaultToolRegistry() {
       phase: "drafting",
       cluster: "visualization",
       failurePolicy: "record",
-      execute: ({ question, claims, sources }) => planVisualizations({ question, claims, sources })
+      execute: ({ question, claims, sources, evidenceCards }) => planVisualizations({ question, claims, sources, evidenceCards })
     })
     .register({
       name: "web_search",
@@ -1323,6 +2373,8 @@ export function createDefaultToolRegistry() {
         runMode: run.meta.runMode,
         sourceBudget: run.meta.sourceBudget,
         tavilyApiKey: run.tavilyApiKey,
+        braveApiKey: run.braveApiKey,
+        firecrawlApiKey: run.firecrawlApiKey,
         allowDemoFallback: run.allowDemoFallback,
         forceDemoTools: run.forceDemoTools
       }, {
@@ -1334,8 +2386,10 @@ export function createDefaultToolRegistry() {
       label: "Web Fetch",
       runner: "http",
       failurePolicy: "record",
-      execute: ({ url, query }, { run }) => fetchPage(url, {
+      execute: ({ url, query, rawContent }, { run }) => fetchPage(url, {
         query,
+        rawContent,
+        firecrawlApiKey: run.firecrawlApiKey,
         allowDemoFallback: run.allowDemoFallback,
         forceDemoTools: run.forceDemoTools,
         fetchImpl: run.fetchImpl
@@ -1387,9 +2441,7 @@ export function createDefaultToolRegistry() {
       label: "MCP Tool",
       runner: "mcp",
       failurePolicy: "record",
-      execute: () => {
-        throw new Error("MCP adapter is not configured for this demo runtime yet.");
-      }
+      execute: (input, context) => invokeAllowlistedMcp(input, context)
     });
 }
 
@@ -1482,6 +2534,7 @@ async function executeDeepResearchRun(run) {
       parentId: "ontology-runtime",
       salience: 0.9,
       confidence: 0.9,
+      executionStep: executionStep("plan"),
       attributes: {
         questions: String(plan.researchQuestions.length),
         queries: String(plan.searchQueries.length),
@@ -1525,17 +2578,86 @@ async function executeDeepResearchRun(run) {
     await waitForRun(run, 700);
     await waitUntilRunnable(run);
 
-    const searchResults = await Promise.all(queryNodes.map((queryNode) =>
-      runRegisteredTool(run, registry, "search", { query: queryNode.summary, queryId: queryNode.id })
+    const searchSettled = await Promise.allSettled(queryNodes.map((queryNode) =>
+      runRegisteredTool(run, registry, "search", { query: queryNode.shortBody, queryId: queryNode.id }, {
+        nodeExtra: {
+          salience: 0.5,
+          importance: 0.46
+        }
+      })
     ));
+    const searchResults = searchSettled
+      .filter((result) => result.status === "fulfilled")
+      .map((result) => result.value);
+    const rejectedSearches = searchSettled.filter((result) => result.status === "rejected");
+    const usableSearchResults = searchResults.filter(hasUsableSearchObservation);
+    const failedSearchResults = searchResults.filter((result) => !hasUsableSearchObservation(result));
     for (const result of searchResults) {
-      assertToolOk(result, "Search Branch");
-      edgeEvent(run, "graph_build", "Search tool 读取对应 query。", { id: `edge-${result.output.queryId}-${result.toolCall.id}`, from: result.output.queryId, to: result.toolCall.id, kind: "uses_tool", confidence: 0.8 });
+      if (result.output.queryId) {
+        edgeEvent(run, "graph_build", "Search tool 读取对应 query。", {
+          id: `edge-${result.output.queryId}-${result.toolCall.id}`,
+          from: result.output.queryId,
+          to: result.toolCall.id,
+          kind: "uses_tool",
+          confidence: result.ok ? 0.8 : 0.32
+        });
+      }
     }
-    const sourceCandidates = dedupeSearchSources(searchResults.map((result) => result.output), plan.sourceBudget);
+    if (usableSearchResults.length === 0) {
+      const firstError = failedSearchResults[0]?.toolCall?.error || rejectedSearches[0]?.reason?.message || "no usable search branch";
+      throw new Error(`Deep research search produced no usable sources: ${firstError}`);
+    }
+    const fallbackSearchOutputs = [];
+    if (run.allowDemoFallback) {
+      fallbackSearchOutputs.push({
+        queryId: "search-summary",
+        query: `${run.meta.question} fallback source recovery`,
+        items: [
+          ...demoSearchItems(`${run.meta.question} fallback`),
+          ...demoSearchItems(`${run.meta.question} recovery`)
+        ].map((item) => ({
+          ...item,
+          queryId: "search-summary",
+          query: `${run.meta.question} fallback source recovery`
+        }))
+      });
+    }
+    let sourceCandidates = dedupeSearchSources(usableSearchResults.map((result) => result.output), plan.sourceBudget);
+    const usedFallbackSources = sourceCandidates.length < 8 && fallbackSearchOutputs.length > 0;
+    if (usedFallbackSources) {
+      sourceCandidates = dedupeSearchSources([
+        ...usableSearchResults.map((result) => result.output),
+        ...fallbackSearchOutputs
+      ], plan.sourceBudget);
+    }
     if (sourceCandidates.length < 8) {
       throw new Error(`Deep research requires at least 8 usable sources; got ${sourceCandidates.length}.`);
     }
+    const searchStepStatus = failedSearchResults.length > 0 || rejectedSearches.length > 0 || usedFallbackSources ? "degraded" : "completed";
+    nodeEvent(run, "graph_build", searchStepStatus === "degraded"
+      ? `搜索分支降级完成：${usableSearchResults.length} 个分支可用，${failedSearchResults.length + rejectedSearches.length} 个失败。`
+      : `搜索分支完成：${usableSearchResults.length} 个分支返回可用来源。`, {
+        id: "search-summary",
+        kind: "observation",
+        label: "搜索汇总",
+        shortBody: `${sourceCandidates.length} sources / ${failedSearchResults.length + rejectedSearches.length} failures`,
+        summary: usedFallbackSources
+          ? "部分搜索分支失败或来源不足，已使用 demo fallback 来源补足并继续生成报告。"
+          : `搜索阶段保留 ${sourceCandidates.length} 个候选来源，失败分支被折叠为降级状态。`,
+        status: "observed",
+        cluster: "search",
+        parentId: "research-plan",
+        salience: searchStepStatus === "degraded" ? 0.78 : 0.84,
+        confidence: searchStepStatus === "degraded" ? 0.62 : 0.84,
+        executionStep: executionStep("search", searchStepStatus),
+        attributes: {
+          usableBranches: String(usableSearchResults.length),
+          failedBranches: String(failedSearchResults.length + rejectedSearches.length),
+          sources: String(sourceCandidates.length),
+          fallback: usedFallbackSources ? "demo sources used" : "not used"
+        }
+      });
+    edgeEvent(run, "graph_build", "执行主路径进入搜索汇总。", executionEdge("edge-flow-plan-search", "research-plan", "search-summary", searchStepStatus === "degraded" ? 0.7 : 0.88));
     for (const source of sourceCandidates) {
       nodeEvent(run, "graph_build", `来源候选已入图：${source.title}`, {
         id: source.id,
@@ -1545,7 +2667,7 @@ async function executeDeepResearchRun(run) {
         summary: `该来源由检索分支“${source.query}”返回，用于支撑“${topicLabel(run.meta.question)}”的证据抽取。摘要：${compactText(source.snippet, 220)}`,
         status: "observed",
         cluster: "sources",
-        parentId: source.queryId,
+        parentId: source.queryId || "search-summary",
         sourceRefs: [source.url],
         salience: 0.52,
         confidence: 0.74,
@@ -1564,39 +2686,65 @@ async function executeDeepResearchRun(run) {
     await waitUntilRunnable(run);
 
     const fetchResults = await Promise.all(sourceCandidates.map((source) =>
-      runRegisteredTool(run, registry, "fetch", { url: source.url, query: run.meta.question })
+      runRegisteredTool(run, registry, "fetch", { url: source.url, query: run.meta.question, rawContent: source.rawContent }, {
+        nodeExtra: {
+          salience: 0.34,
+          importance: 0.34,
+          confidence: 0.34
+        }
+      })
     ));
     const fetchedByUrl = {};
+    const failedFetches = [];
     fetchResults.forEach((result, index) => {
       const source = sourceCandidates[index];
       edgeEvent(run, "graph_build", "Fetch tool 读取来源正文。", { id: `edge-${source.id}-${result.toolCall.id}`, from: source.id, to: result.toolCall.id, kind: "uses_tool", confidence: result.ok ? 0.76 : 0.38 });
       if (result.ok) {
         fetchedByUrl[source.url] = result.output.text ?? "";
       } else {
-        nodeEvent(run, "graph_build", `来源读取失败但保留为 degraded source：${source.title}`, {
-          id: `${source.id}-degraded`,
-          kind: "source",
-          label: `${source.title.slice(0, 14)} 失败`,
-          shortBody: result.toolCall.error,
-          summary: `Fetch failed: ${result.toolCall.error}`,
-          status: "failed",
-          cluster: "sources",
-          parentId: source.id,
-          sourceRefs: [source.url],
-          salience: 0.72,
-          confidence: 0.28,
-          attributes: {
-            status: "degraded",
-            error: result.toolCall.error || "fetch failed"
-          }
-        });
+        failedFetches.push({ source, result });
       }
     });
+    const fetchStepStatus = failedFetches.length > 0 ? "degraded" : "completed";
+    nodeEvent(run, "graph_build", fetchStepStatus === "degraded"
+      ? `网页抓取降级完成：${failedFetches.length} 个来源抓取失败，已使用搜索摘要继续。`
+      : "网页抓取完成，来源正文已进入排序阶段。", {
+        id: "fetch-summary",
+        kind: "observation",
+        label: "抓取汇总",
+        shortBody: `${fetchResults.length - failedFetches.length} fetched / ${failedFetches.length} degraded`,
+        summary: failedFetches.length > 0
+          ? `${failedFetches.length} 个来源无法读取正文，runtime 保留失败工具记录，但后续使用搜索摘要、raw_content 或 snippet 继续抽取证据。`
+          : "所有来源抓取完成，后续排序会优先使用正文内容。",
+        status: "observed",
+        cluster: "sources",
+        parentId: "search-summary",
+        salience: fetchStepStatus === "degraded" ? 0.78 : 0.82,
+        confidence: fetchStepStatus === "degraded" ? 0.58 : 0.82,
+        executionStep: executionStep("fetch", fetchStepStatus),
+        attributes: {
+          fetched: String(fetchResults.length - failedFetches.length),
+          degraded: String(failedFetches.length),
+          fallback: failedFetches.length > 0 ? "search snippets used" : "not needed"
+        },
+        episodes: failedFetches.slice(0, 4).map(({ source, result }, index) => ({
+          id: `fetch-degraded-${index + 1}`,
+          time: "00:14",
+          title: source.title,
+          detail: result.toolCall.error || "fetch failed"
+        }))
+      });
+    edgeEvent(run, "graph_build", "执行主路径进入网页抓取汇总。", executionEdge("edge-flow-search-fetch", "search-summary", "fetch-summary", fetchStepStatus === "degraded" ? 0.68 : 0.86));
     await waitForRun(run, 900);
     await waitUntilRunnable(run);
 
-    const rank = await runRegisteredTool(run, registry, "rank_source", { sources: sourceCandidates, fetchedByUrl });
+    const rank = await runRegisteredTool(run, registry, "rank_source", { sources: sourceCandidates, fetchedByUrl }, {
+      nodeExtra: {
+        executionStep: executionStep("rank")
+      }
+    });
     assertToolOk(rank, "Rank Sources");
+    edgeEvent(run, "evidence", "执行主路径进入来源排序。", executionEdge("edge-flow-fetch-rank", "fetch-summary", rank.toolCall.id));
     for (const source of rank.output.sources) {
       nodeEvent(run, "evidence", `来源质量已评分：${source.title}`, {
         id: source.id,
@@ -1625,8 +2773,13 @@ async function executeDeepResearchRun(run) {
     const extract = await runRegisteredTool(run, registry, "extract", {
       question: run.meta.question,
       rankedSources: rank.output.sources
+    }, {
+      nodeExtra: {
+        executionStep: executionStep("extract")
+      }
     });
     assertToolOk(extract, "Extract Evidence");
+    edgeEvent(run, "evidence", "执行主路径进入证据抽取。", executionEdge("edge-flow-rank-extract", rank.toolCall.id, extract.toolCall.id));
     const evidenceCards = usableEvidenceItems(extract.output.items);
     if (evidenceCards.length < 8) {
       throw new Error(`Evidence Extract produced ${evidenceCards.length} usable cards; expected at least 8.`);
@@ -1661,8 +2814,13 @@ async function executeDeepResearchRun(run) {
     await waitForRun(run, 900);
     await waitUntilRunnable(run);
 
-    const verification = await runRegisteredTool(run, registry, "cross_check", { evidenceCards });
+    const verification = await runRegisteredTool(run, registry, "cross_check", { evidenceCards }, {
+      nodeExtra: {
+        executionStep: executionStep("verify")
+      }
+    });
     assertToolOk(verification, "Cross Check");
+    edgeEvent(run, "reasoning", "执行主路径进入交叉验证。", executionEdge("edge-flow-extract-verify", extract.toolCall.id, verification.toolCall.id));
     for (const claim of verification.output.claims) {
       const claimNode = {
         id: claim.id,
@@ -1741,9 +2899,15 @@ async function executeDeepResearchRun(run) {
     const charts = await runRegisteredTool(run, registry, "chart_plan", {
       question: run.meta.question,
       claims: verification.output.claims,
-      sources: rank.output.sources
+      sources: rank.output.sources,
+      evidenceCards
+    }, {
+      nodeExtra: {
+        executionStep: executionStep("visualize")
+      }
     });
     assertToolOk(charts, "Plan Charts");
+    edgeEvent(run, "drafting", "执行主路径进入可视化规划。", executionEdge("edge-flow-verify-visualize", verification.toolCall.id, charts.toolCall.id));
     const visualizationNodeIds = charts.output.blocks.map((block) => `visual-${block.id}`);
     for (const block of charts.output.blocks) {
       const nodeId = `visual-${block.id}`;
@@ -1779,9 +2943,14 @@ async function executeDeepResearchRun(run) {
       verification: verification.output,
       examples: cases.output.examples,
       visualizations: charts.output
+    }, {
+      nodeExtra: {
+        executionStep: executionStep("write")
+      }
     });
     assertToolOk(reportTool, "Report Write");
-    const report = reportTool.output.report;
+    edgeEvent(run, "drafting", "执行主路径进入报告写作。", executionEdge("edge-flow-visualize-write", charts.toolCall.id, reportTool.toolCall.id));
+    const report = validateAndNormalizeArtifact(reportTool.output.report, run);
     for (const section of report.sections) {
       await waitForRun(run, 360);
       await waitUntilRunnable(run);
@@ -1798,6 +2967,7 @@ async function executeDeepResearchRun(run) {
         reportAnchorId: section.id,
         salience: 0.8,
         confidence: 0.84,
+        executionStep: executionStep("write"),
         attributes: {
           sourceNodes: section.sourceNodeIds.join(", "),
           reportSection: section.id
@@ -1806,6 +2976,7 @@ async function executeDeepResearchRun(run) {
       };
       nodeEvent(run, "drafting", `长报告章节写入：${section.title}`, sectionNode);
       edgeEvent(run, "drafting", "Section 映射回 report writer。", { id: `edge-report-${sectionNode.id}`, from: reportTool.toolCall.id, to: sectionNode.id, kind: "becomes_section", confidence: 0.86 });
+      edgeEvent(run, "drafting", "执行主路径写入报告章节。", executionEdge(`edge-flow-report-${sectionNode.id}`, reportTool.toolCall.id, sectionNode.id, 0.78));
       for (const sourceNodeId of section.sourceNodeIds.slice(0, 4)) {
         edgeEvent(run, "drafting", "Section 绑定来源图谱节点。", { id: `edge-${sourceNodeId}-${sectionNode.id}`, from: sourceNodeId, to: sectionNode.id, kind: "becomes_section", confidence: 0.78 });
       }
@@ -1831,7 +3002,15 @@ async function executeDeepResearchRun(run) {
     } else {
       run.meta.status = "failed";
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      addEvent(run, { type: "run_failed", phase: run.events.at(-1)?.phase ?? "evidence", message: `Run 执行失败：${errorMessage}`, error: errorMessage });
+      const errorLog = recordRunError(run, error, { phase: run.events.at(-1)?.phase ?? "evidence" });
+      addEvent(run, {
+        type: "run_failed",
+        phase: errorLog.phase,
+        message: `Run 执行失败：${errorMessage}`,
+        error: errorMessage,
+        errorLog,
+        finalReport: failureReportFromErrorLog(run, errorLog)
+      });
     }
     broadcast(run, "run-closed", { runId: run.meta.id });
   }
@@ -2064,14 +3243,14 @@ async function executeLegacyRun(run) {
     edgeEvent(run, "drafting", "Report writer 复用 LLM Analyze observation。", { id: "edge-analysis-report-tool", from: llmAnalysis.toolCall.id, to: reportTool.toolCall.id, kind: "observes", confidence: 0.88 });
     assertToolOk(reportTool, "Report Write");
 
-    const report = reportFrom(run, evidenceNodes, claimNode.id, {
+    const report = validateAndNormalizeArtifact(reportFrom(run, evidenceNodes, claimNode.id, {
       search: search.toolCall.id,
       fetch: fetched.toolCall.id,
       documentRead: documentRead.toolCall.id,
       extract: extract.toolCall.id,
       analyze: llmAnalysis.toolCall.id,
       reportWrite: reportTool.toolCall.id
-    }, reportTool.output);
+    }, reportTool.output), run);
     for (const section of report.sections) {
       await waitForRun(run, 650);
       await waitUntilRunnable(run);
@@ -2115,7 +3294,15 @@ async function executeLegacyRun(run) {
     } else {
       run.meta.status = "failed";
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      addEvent(run, { type: "run_failed", phase: run.events.at(-1)?.phase ?? "evidence", message: `Run 执行失败：${errorMessage}`, error: errorMessage });
+      const errorLog = recordRunError(run, error, { phase: run.events.at(-1)?.phase ?? "evidence" });
+      addEvent(run, {
+        type: "run_failed",
+        phase: errorLog.phase,
+        message: `Run 执行失败：${errorMessage}`,
+        error: errorMessage,
+        errorLog,
+        finalReport: failureReportFromErrorLog(run, errorLog)
+      });
     }
     broadcast(run, "run-closed", { runId: run.meta.id });
   }
@@ -2126,6 +3313,32 @@ function envProviderKey() {
     || process.env.MIMO_API_KEY
     || process.env.OPENAI_API_KEY
     || "";
+}
+
+export function createDiagnosticsSnapshot() {
+  const registry = createDefaultToolRegistry();
+  return {
+    runtime: "loading-mind-runtime",
+    delivery: "sse-or-snapshot",
+    orchestration: {
+      mode: "demo_deep_research",
+      sourceBudget: MAX_SOURCE_BUDGET,
+      fallbackMode: process.env.LOADING_MIND_FORCE_DEMO_TOOLS === "1" ? "forced_demo_tools" : "mode_dependent",
+      mcpAdapterAvailable: registry.list().some((tool) => tool.name === "mcp.invoke")
+    },
+    providers: [
+      { name: "tavily", role: "primary_search", configured: Boolean(tavilyApiKey()) },
+      { name: "brave", role: "fallback_search", configured: Boolean(braveSearchApiKey()) },
+      { name: "firecrawl", role: "fallback_search_and_scrape", configured: Boolean(firecrawlApiKey()) },
+      { name: "exa", role: "mcp_semantic_search", configured: Boolean(exaApiKey()) },
+      { name: "llm", role: "report_write", configured: Boolean(envProviderKey()) }
+    ],
+    mcp: {
+      allowlist: ["tavily.search", "firecrawl.search", "firecrawl.scrape", "exa.search"],
+      policy: "read_only_registered_tools"
+    },
+    tools: registry.list()
+  };
 }
 
 function createRun(body, options = {}) {
@@ -2156,11 +3369,16 @@ function createRun(body, options = {}) {
     events: [],
     clients: new Set(),
     excludedEvidenceIds: new Set(),
+    errorLogs: [],
+    auditLogs: [],
     startedAt: createdAt,
     virtualElapsedMs: 0,
     toolIndex: 0,
     providerConfig,
     tavilyApiKey: String(body.tavilyApiKey || "").trim(),
+    braveApiKey: String(body.braveApiKey || "").trim(),
+    firecrawlApiKey: String(body.firecrawlApiKey || "").trim(),
+    exaApiKey: String(body.exaApiKey || "").trim(),
     persistEvents: options.persistEvents ?? true,
     delayScale: options.delayScale ?? 1,
     allowDemoFallback,
@@ -2188,7 +3406,9 @@ export async function createRunSnapshot(body, options = {}) {
   await executeRun(run);
   return {
     run: run.meta,
-    events: run.events
+    events: run.events,
+    errorLogs: run.errorLogs,
+    auditLogs: run.auditLogs
   };
 }
 
@@ -2201,6 +3421,8 @@ function readPersistedRun(id) {
   const run = {
     meta: payload.meta,
     events: payload.events ?? [],
+    errorLogs: payload.errorLogs ?? [],
+    auditLogs: payload.auditLogs ?? [],
     clients: new Set(),
     excludedEvidenceIds: new Set(payload.excludedEvidenceIds ?? []),
     startedAt: payload.meta.createdAt,
@@ -2217,6 +3439,12 @@ export function agentRuntimePlugin() {
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
         const url = new URL(req.url ?? "/", "http://127.0.0.1");
+        if (req.method === "GET" && url.pathname === "/api/diagnostics") {
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify(createDiagnosticsSnapshot()));
+          return;
+        }
+
         if (!url.pathname.startsWith("/api/runs")) {
           next();
           return;

@@ -65,12 +65,15 @@ Useful environment variables:
 
 - `LOADING_MIND_PROVIDER_API_KEY`, `MIMO_API_KEY`, or `OPENAI_API_KEY` supplies the provider key server-side.
 - `TAVILY_API_KEY` enables Live search through Tavily.
+- `BRAVE_SEARCH_API_KEY` enables Brave Search as the first Live search fallback.
+- `FIRECRAWL_API_KEY` enables Firecrawl Search and Scrape fallback.
+- `EXA_API_KEY` enables the allowlisted `exa.search` MCP-style semantic search adapter.
 - `LOADING_MIND_DEMO_MODE=1` allows demo fallback observations when external tools are unavailable.
 - `LOADING_MIND_FORCE_DEMO_TOOLS=1` forces built-in demo tool outputs for public trial stability.
 
-Demo mode keeps sandbox fallbacks available for a stable public presentation. Live mode disables silent demo fallbacks: if Tavily, web fetch, or the configured provider fails, the run records visible failed tool nodes and stops or degrades according to the runtime failure rules.
+Demo mode keeps sandbox fallbacks available for a stable public presentation. Live mode disables silent demo fallbacks: search runs through Tavily, then Brave Search, then Firecrawl Search when keys are configured. Failed runs record structured error logs and render a failure report with run id, failed tool, error type, redacted input summary, and next action.
 
-In local development, the Tavily key can be provided either through `.env.local` or the Tavily Search API Key field in the run configuration form. The form value is used only for the submitted run and is not written into run metadata.
+In local development, search keys can be provided either through `.env.local` or the matching key fields in the run configuration form. Form values are used only for the submitted run and are not written into run metadata.
 
 Local development still uses the Vite middleware and SSE runtime so pause, resume, cancel, retry, and exclude interactions remain available while iterating.
 
@@ -98,6 +101,7 @@ Local development still uses the Vite middleware and SSE runtime so pause, resum
 - `web_search` failure stops the run and emits `run_failed`.
 - `web_fetch` failure can continue only when search still returned usable observations; the graph records a degraded observation.
 - `evidence_extract`, `llm_analyze`, and `report_write` failures stop the run before normal report synthesis.
+- `report_write` output is validated before completion; malformed reports are normalized when possible or converted into a failure report.
 - Failed tool nodes stay visible and inspectable instead of being replaced by empty evidence.
 
 ## Project Updates

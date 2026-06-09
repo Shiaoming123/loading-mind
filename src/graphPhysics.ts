@@ -52,19 +52,19 @@ export type NodeRenderToken = {
 };
 
 const kindRadius: Record<GraphNodeKind, number> = {
-  task_intent: 19,
-  ontology: 15,
-  research_plan: 15,
-  search_query: 12,
-  source: 11,
-  entity: 12,
-  evidence: 12,
+  task_intent: 22,
+  ontology: 16,
+  research_plan: 16,
+  search_query: 11,
+  source: 9,
+  entity: 11,
+  evidence: 10,
   tool_call: 14,
-  observation: 12,
+  observation: 11,
   claim: 15,
   counterclaim: 14,
   verification: 14,
-  example: 12,
+  example: 11,
   visualization: 16,
   section: 16
 };
@@ -96,6 +96,7 @@ const edgePriority: Record<GraphEdgeKind, number> = {
   returns_source: 3,
   queries: 2,
   observes: 2,
+  retry_of: 3,
   extracts: 1
 };
 
@@ -145,16 +146,16 @@ export function deriveNodeImportance(node: GraphNode) {
     case "schema":
       return 0.76;
     case "operation":
-      return 0.7;
+      return node.kind === "tool_call" ? 0.68 : 0.54;
     case "record":
     default:
-      return node.kind === "evidence" || node.kind === "example" ? 0.66 : 0.58;
+      return node.kind === "evidence" || node.kind === "example" ? 0.48 : 0.42;
   }
 }
 
 export function nodeRadius(node: GraphNode) {
   const base = node.layout?.radius ?? kindRadius[node.kind];
-  return base + deriveNodeImportance(node) * 4;
+  return base + deriveNodeImportance(node) * 3.4;
 }
 
 export function effectiveNodeStatus(node: GraphNode): EffectiveNodeStatus {
@@ -190,8 +191,8 @@ export function nodeRenderToken(node: GraphNode, active = false): NodeRenderToke
       halo: "209, 47, 36",
       label: "#7a1209",
       ringWidth: active ? 3.6 : 3,
-      haloAlpha: active ? 0.26 : 0.18,
-      haloScale: 2.6,
+      haloAlpha: active ? 0.2 : 0.15,
+      haloScale: 2.35,
       pulseStrength: 0.14,
       warningRing: true,
       forceLabel: true
@@ -206,9 +207,9 @@ export function nodeRenderToken(node: GraphNode, active = false): NodeRenderToke
       halo: "243, 164, 59",
       label: "#8a4e14",
       ringWidth: active ? 2.4 : 1.8,
-      haloAlpha: active ? 0.18 : 0.11,
-      haloScale: 2.9,
-      pulseStrength: 0.1,
+      haloAlpha: active ? 0.14 : 0.08,
+      haloScale: 2.35,
+      pulseStrength: 0.08,
       warningRing: false,
       forceLabel: active
     };
@@ -217,14 +218,18 @@ export function nodeRenderToken(node: GraphNode, active = false): NodeRenderToke
   if (status === "succeeded" || status === "observed") {
     return {
       status,
-      fill: tier === "operation" ? "#8dc7c0" : base.fill,
-      stroke: tier === "operation" ? "#2f736d" : base.stroke,
+      fill: tier === "operation"
+        ? active ? "#8dc7c0" : "rgba(141, 199, 192, 0.46)"
+        : active ? base.fill : "rgba(183, 217, 211, 0.5)",
+      stroke: tier === "operation"
+        ? active ? "#2f736d" : "rgba(47, 115, 109, 0.24)"
+        : active ? base.stroke : "rgba(47, 43, 37, 0.22)",
       halo: tier === "operation" ? "141, 199, 192" : base.halo,
       label: tier === "operation" ? "#2f736d" : base.label,
-      ringWidth: active ? 2 : 1.35,
-      haloAlpha: active ? 0.13 : 0.07,
-      haloScale: 2.45,
-      pulseStrength: active ? 0.05 : 0.02,
+      ringWidth: active ? 2 : 0.85,
+      haloAlpha: active ? 0.08 : 0.018,
+      haloScale: active ? 2.05 : 1.55,
+      pulseStrength: active ? 0.035 : 0.006,
       warningRing: false,
       forceLabel: false
     };
@@ -232,16 +237,18 @@ export function nodeRenderToken(node: GraphNode, active = false): NodeRenderToke
 
   return {
     status,
-    fill: base.fill,
-    stroke: status === "excluded" ? "rgba(47, 43, 37, 0.22)" : "#6e4a1f",
+    fill: active ? base.fill : "rgba(183, 217, 211, 0.48)",
+    stroke: status === "excluded"
+      ? "rgba(47, 43, 37, 0.22)"
+      : active ? "#6e4a1f" : "rgba(110, 74, 31, 0.26)",
     halo: base.halo,
     label: base.label,
     ringWidth: active ? 2.3 : 1.55,
-    haloAlpha: active ? 0.15 : 0.08,
-    haloScale: 2.55,
-    pulseStrength: active ? 0.06 : 0.02,
+    haloAlpha: active ? 0.1 : 0.024,
+    haloScale: active ? 2.15 : 1.65,
+    pulseStrength: active ? 0.04 : 0.006,
     warningRing: false,
-    forceLabel: tier === "output"
+    forceLabel: false
   };
 }
 
@@ -322,7 +329,7 @@ export function initialNodePosition(
   const anchor = clusterAnchor(node.cluster, viewport);
 
   if (parent) {
-    const distance = 54 + hash * 44;
+    const distance = 42 + hash * 34;
     return {
       x: (parent.x ?? anchor.x) + Math.cos(angle) * distance,
       y: (parent.y ?? anchor.y) + Math.sin(angle) * distance
@@ -430,13 +437,16 @@ export function labelVisible(node: ForceGraphNode, focusIds: Set<string>) {
   if (nodeRenderToken(node).forceLabel) {
     return true;
   }
-  if (node.tier === "core" || node.tier === "output" || node.kind === "ontology") {
+  if (node.tier === "core" || node.kind === "ontology") {
+    return true;
+  }
+  if (node.tier === "output" && node.kind !== "section" && (node.salience ?? 0) > 0.8) {
     return true;
   }
   if (focusIds.has(node.id)) {
     return true;
   }
-  return (node.salience ?? 0) > 0.86;
+  return node.tier === "schema" && (node.salience ?? 0) > 0.86;
 }
 
 export function clusterSeeds(nodes: ForceGraphNode[]) {

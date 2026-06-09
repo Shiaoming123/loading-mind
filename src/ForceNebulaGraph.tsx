@@ -11,8 +11,7 @@ import type {
   GraphSceneSnapshot,
   ReportSection,
   SceneInsets,
-  TaskStatus,
-  VisualMode
+  TaskStatus
 } from "./types";
 import {
   aggregateVisibleEdges,
@@ -38,13 +37,11 @@ type Props = {
   formedClusters: GraphCluster[];
   emphasizedNodeId: string | null;
   status: TaskStatus;
-  particlesEnabled: boolean;
-  visualMode: VisualMode;
   sceneInsets: SceneInsets;
   reportFocusNodeId: string | null;
   reportSections: ReportSection[];
   onSceneUpdate: (scene: GraphSceneSnapshot) => void;
-  onRetryTool: (toolNodeId: string) => void;
+  onRetryTool: (toolNodeId: string) => Promise<unknown> | void;
   onExcludeEvidence: (evidenceId: string) => void;
 };
 
@@ -59,6 +56,11 @@ type NodeSnapshot = {
   id: string;
   x: number;
   y: number;
+};
+
+type RetryState = {
+  status: "pending" | "succeeded" | "failed";
+  message: string;
 };
 
 const nodeKindLabel: Record<GraphNodeKind, string> = {
@@ -99,6 +101,7 @@ const edgeKindLabel: Record<GraphEdgeKind, string> = {
   feeds_visual: "feeds visual",
   observes: "observes",
   uses_tool: "uses tool",
+  retry_of: "retry of",
   synthesizes: "synthesizes",
   becomes_section: "becomes section"
 };
@@ -171,14 +174,37 @@ function pointerToCanvas(event: PointerEvent, canvas: HTMLCanvasElement) {
   };
 }
 
+export function summarizeToolInput(input: Record<string, unknown>) {
+  const parts = Object.keys(input).slice(0, 4).map((key) => {
+    const value = input[key];
+    if (Array.isArray(value)) {
+      return `${key}: ${value.length} items`;
+    }
+    if (value && typeof value === "object") {
+      return `${key}: object`;
+    }
+    const text = String(value ?? "");
+    return `${key}: ${text.length > 64 ? `${text.slice(0, 64)}...` : text}`;
+  });
+  return parts.join(" / ") || "No input";
+}
+
+export function visibleNodeAttributes(attributes: Record<string, string>) {
+  return Object.entries(attributes)
+    .filter(([key]) => key !== "input")
+    .slice(0, 5)
+    .map(([key, value]) => ({
+      key,
+      value: value.length > 180 ? `${value.slice(0, 180)}...` : value
+    }));
+}
+
 export function ForceNebulaGraph({
   nodes,
   edges,
   formedClusters,
   emphasizedNodeId,
   status,
-  particlesEnabled,
-  visualMode,
   sceneInsets,
   reportFocusNodeId,
   reportSections,
@@ -199,20 +225,17 @@ export function ForceNebulaGraph({
   const propsRef = useRef({
     formedClusters,
     status,
-    particlesEnabled,
-    visualMode,
     emphasizedNodeId,
     reportFocusNodeId
   });
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedSnapshot, setSelectedSnapshot] = useState<NodeSnapshot | null>(null);
+  const [retryStates, setRetryStates] = useState<Record<string, RetryState>>({});
 
   propsRef.current = {
     formedClusters,
     status,
-    particlesEnabled,
-    visualMode,
     emphasizedNodeId,
     reportFocusNodeId
   };
@@ -239,22 +262,22 @@ export function ForceNebulaGraph({
   useEffect(() => {
     const simulation = simulationRef.current;
     const linkForce = linkForceRef.current
-      .distance((edge) => edge.distance ?? 108)
-      .strength((edge) => edge.strength ?? 0.46);
+      .distance((edge) => edge.distance ?? 86)
+      .strength((edge) => edge.strength ?? 0.62);
 
     simulation
       .force("link", linkForce)
-      .force("charge", forceManyBody<ForceGraphNode>().strength((node) => -260 * node.mass))
-      .force("collide", forceCollide<ForceGraphNode>().radius((node) => node.radius + 22).iterations(3))
+      .force("charge", forceManyBody<ForceGraphNode>().strength((node) => -165 * node.mass))
+      .force("collide", forceCollide<ForceGraphNode>().radius((node) => node.radius + 14).iterations(3))
       .force(
         "clusterX",
-        forceX<ForceGraphNode>((node) => clusterAnchor(node.cluster, viewportRef.current).x).strength(0.055)
+        forceX<ForceGraphNode>((node) => clusterAnchor(node.cluster, viewportRef.current).x).strength(0.105)
       )
       .force(
         "clusterY",
-        forceY<ForceGraphNode>((node) => clusterAnchor(node.cluster, viewportRef.current).y).strength(0.058)
+        forceY<ForceGraphNode>((node) => clusterAnchor(node.cluster, viewportRef.current).y).strength(0.11)
       )
-      .velocityDecay(0.38)
+      .velocityDecay(0.42)
       .alphaDecay(0.036)
       .stop();
   }, []);
@@ -283,7 +306,13 @@ export function ForceNebulaGraph({
 
     resize();
     window.addEventListener("resize", resize);
-    return () => window.removeEventListener("resize", resize);
+    window.visualViewport?.addEventListener("resize", resize);
+    window.visualViewport?.addEventListener("scroll", resize);
+    return () => {
+      window.removeEventListener("resize", resize);
+      window.visualViewport?.removeEventListener("resize", resize);
+      window.visualViewport?.removeEventListener("scroll", resize);
+    };
   }, [sceneInsets]);
 
   useEffect(() => {
@@ -463,8 +492,7 @@ export function ForceNebulaGraph({
       const currentProps = propsRef.current;
       const activeFocusId = currentProps.reportFocusNodeId ?? selectedNodeId ?? hoveredNodeId;
       const focusIds = connectedIds(activeFocusId, edgesRef.current);
-      const tickCount = currentProps.status === "paused" ? 1 : currentProps.particlesEnabled ? 3 : 2;
-      const mode = currentProps.visualMode;
+      const tickCount = currentProps.status === "paused" ? 1 : 2;
 
       if (simulation.alpha() > 0.012) {
         for (let tick = 0; tick < tickCount; tick += 1) {
@@ -483,7 +511,7 @@ export function ForceNebulaGraph({
         clampToViewport(node, viewport);
         const trail = trailsRef.current.get(node.id) ?? [];
         trail.push({ id: node.id, x: node.x ?? 0, y: node.y ?? 0 });
-        trailsRef.current.set(node.id, trail.slice(currentProps.particlesEnabled ? -10 : -4));
+        trailsRef.current.set(node.id, trail.slice(-4));
       }
 
       const selectedRuntimeNode = getNode(nodesRef.current, selectedNodeId);
@@ -514,7 +542,7 @@ export function ForceNebulaGraph({
       for (const seed of clusterSeeds(nodesRef.current).filter((seed) => currentProps.formedClusters.includes(seed.cluster))) {
         const color = clusterColor[seed.cluster];
         const gradient = context.createRadialGradient(seed.x, seed.y, 0, seed.x, seed.y, seed.radius);
-        gradient.addColorStop(0, mode === "system" ? color.stroke : color.fill);
+        gradient.addColorStop(0, color.fill);
         gradient.addColorStop(0.72, "rgba(255, 252, 244, 0.012)");
         gradient.addColorStop(1, "rgba(255, 252, 244, 0)");
         context.fillStyle = gradient;
@@ -535,7 +563,7 @@ export function ForceNebulaGraph({
         const focused = isEdgeFocused(edge, activeFocusId);
         const faded = activeFocusId && !focused;
         const curve = edgeCurve(from, to);
-        const alpha = faded ? 0.028 : focused ? (mode === "system" ? 0.42 : 0.31) : mode === "system" ? 0.13 : 0.08;
+        const alpha = faded ? 0.028 : focused ? 0.31 : 0.08;
 
         context.beginPath();
         context.moveTo(from.x ?? 0, from.y ?? 0);
@@ -544,7 +572,7 @@ export function ForceNebulaGraph({
           edge.kind === "uses_tool" || edge.kind === "synthesizes"
             ? `rgba(217, 130, 43, ${alpha})`
             : `rgba(62, 133, 129, ${alpha})`;
-        context.lineWidth = focused ? (mode === "system" ? 1.2 : 1) : mode === "system" ? 0.7 : 0.52;
+        context.lineWidth = focused ? 1 : 0.52;
         context.stroke();
 
         if (focused) {
@@ -560,47 +588,17 @@ export function ForceNebulaGraph({
       context.restore();
 
       for (const node of nodesRef.current) {
-        const recentlyAdded = time - node.bornAt < 3600;
         const running = node.status === "running" || node.toolCall?.status === "running";
         const failed = node.status === "failed" || node.toolCall?.status === "failed";
         const focused = focusIds.has(node.id) || node.id === currentProps.emphasizedNodeId || node.id === currentProps.reportFocusNodeId;
         const faded = activeFocusId && !focused;
         const selected = node.id === selectedNodeId;
-        const activeSignal = selected || focused || running || failed || recentlyAdded;
+        const activeSignal = selected || focused || running || failed;
         const token = nodeRenderToken(node, activeSignal);
         const alpha = faded ? 0.22 : 1;
-        const glow = Math.min(0.72, (node.visual?.glow ?? 0.45) + (activeSignal ? 0.16 : 0));
-        const pulse = 1 + Math.sin(time * (mode === "system" ? 0.0035 : 0.0024) + node.radius) * token.pulseStrength;
+        const pulse = 1 + Math.sin(time * 0.0024 + node.radius) * token.pulseStrength;
         const x = node.x ?? 0;
         const y = node.y ?? 0;
-
-        const trail = trailsRef.current.get(node.id) ?? [];
-        if (currentProps.particlesEnabled && !faded) {
-          context.save();
-          context.globalAlpha = 0.18 * alpha;
-          context.strokeStyle = node.tier === "output" ? "rgba(217, 130, 43, 0.36)" : "rgba(141, 199, 192, 0.32)";
-          context.lineWidth = 1;
-          context.beginPath();
-          trail.forEach((point, index) => {
-            if (index === 0) {
-              context.moveTo(point.x, point.y);
-            } else {
-              context.lineTo(point.x, point.y);
-            }
-          });
-          context.stroke();
-          context.restore();
-        }
-
-        const haloScale = node.tier === "core" ? 3.5 : node.tier === "output" ? 3 : node.tier === "operation" ? 2.75 : token.haloScale;
-        const halo = context.createRadialGradient(x, y, 0, x, y, node.radius * (haloScale + glow));
-        halo.addColorStop(0, `rgba(${token.halo}, ${token.haloAlpha * alpha})`);
-        halo.addColorStop(0.5, `rgba(255, 252, 244, ${0.035 * alpha})`);
-        halo.addColorStop(1, "rgba(255, 252, 244, 0)");
-        context.fillStyle = halo;
-        context.beginPath();
-        context.arc(x, y, node.radius * (haloScale + glow), 0, Math.PI * 2);
-        context.fill();
 
         context.save();
         context.globalAlpha = alpha;
@@ -620,25 +618,6 @@ export function ForceNebulaGraph({
           context.lineWidth = 1.2;
           context.beginPath();
           context.arc(x, y, node.radius * 1.9 * warningPulse, 0, Math.PI * 2);
-          context.stroke();
-        }
-
-        if (activeSignal && !token.warningRing) {
-          context.strokeStyle = token.status === "running" ? "rgba(243, 164, 59, 0.44)" : "rgba(62, 133, 129, 0.34)";
-          context.lineWidth = 1;
-          context.beginPath();
-          context.arc(x, y, node.radius * 1.75 * pulse, 0, Math.PI * 2);
-          context.stroke();
-        }
-
-        if (mode === "system" && (selected || focused)) {
-          context.strokeStyle = "rgba(62, 133, 129, 0.28)";
-          context.lineWidth = 1;
-          context.beginPath();
-          context.moveTo(x - node.radius * 2.1, y);
-          context.lineTo(x + node.radius * 2.1, y);
-          context.moveTo(x, y - node.radius * 2.1);
-          context.lineTo(x, y + node.radius * 2.1);
           context.stroke();
         }
 
@@ -684,12 +663,8 @@ export function ForceNebulaGraph({
           context.fillText(nodeKindLabel[node.kind], labelX, labelY);
           context.font =
             node.tier === "core" || node.tier === "output"
-              ? mode === "system"
-                ? "600 15px PingFang SC"
-                : "600 16px PingFang SC"
-              : mode === "system"
-                ? "560 12px PingFang SC"
-                : "560 13px PingFang SC";
+              ? "600 16px PingFang SC"
+              : "560 13px PingFang SC";
           context.strokeStyle = "rgba(255, 252, 244, 0.9)";
           context.lineWidth = token.status === "failed" ? 4 : 3;
           context.fillStyle = token.status === "failed" ? "#691006" : "#2f2b25";
@@ -708,6 +683,35 @@ export function ForceNebulaGraph({
   const inspectorPosition = selectedSnapshot
     ? `${Math.round(selectedSnapshot.x)} / ${Math.round(selectedSnapshot.y)}`
     : "--";
+  const selectedRetryState = selectedNodeId ? retryStates[selectedNodeId] : null;
+  const selectedToolInput = selectedNode?.toolCall?.input ?? null;
+  const selectedVisibleAttributes = selectedNode?.attributes ? visibleNodeAttributes(selectedNode.attributes) : [];
+
+  const handleRetryTool = async (toolNodeId: string) => {
+    setRetryStates((current) => ({
+      ...current,
+      [toolNodeId]: { status: "pending", message: "Retry request sent." }
+    }));
+    try {
+      const result = await onRetryTool(toolNodeId);
+      const message =
+        result && typeof result === "object" && "message" in result
+          ? String((result as { message?: unknown }).message)
+          : "Retry completed. Rerun the task to regenerate downstream report output.";
+      setRetryStates((current) => ({
+        ...current,
+        [toolNodeId]: { status: "succeeded", message }
+      }));
+    } catch (error) {
+      setRetryStates((current) => ({
+        ...current,
+        [toolNodeId]: {
+          status: "failed",
+          message: error instanceof Error ? error.message : "Retry failed."
+        }
+      }));
+    }
+  };
 
   return (
     <section className="force-nebula" ref={shellRef} aria-label="Realtime force-directed knowledge graph">
@@ -722,7 +726,7 @@ export function ForceNebulaGraph({
             transition={{ duration: 0.34, ease: [0.16, 1, 0.3, 1] }}
           >
             <button className="inspector-close" type="button" onClick={() => setSelectedNodeId(null)} aria-label="Close node details">
-              ×
+              x
             </button>
             <span>{nodeKindLabel[selectedNode.kind]}</span>
             <h2>{selectedNode.label}</h2>
@@ -741,10 +745,10 @@ export function ForceNebulaGraph({
                 <dd>{inspectorPosition}</dd>
               </div>
             </dl>
-            {selectedNode.attributes && Object.keys(selectedNode.attributes).length > 0 && (
+            {selectedVisibleAttributes.length > 0 && (
               <div className="inspector-meta">
                 <strong>Attributes</strong>
-                {Object.entries(selectedNode.attributes).slice(0, 5).map(([key, value]) => (
+                {selectedVisibleAttributes.map(({ key, value }) => (
                   <span key={key}>
                     <em>{key}</em>
                     {value}
@@ -780,13 +784,24 @@ export function ForceNebulaGraph({
             {selectedNode.toolCall && (
               <div className="inspector-report-link">
                 <strong>Tool I/O</strong>
-                <span>{JSON.stringify(selectedNode.toolCall.input)}</span>
+                <span>{summarizeToolInput(selectedNode.toolCall.input)}</span>
+                {selectedToolInput && (
+                  <details className="tool-debug">
+                    <summary>Full input</summary>
+                    <pre>{JSON.stringify(selectedToolInput, null, 2)}</pre>
+                  </details>
+                )}
                 {selectedNode.toolCall.outputSummary && <span>{selectedNode.toolCall.outputSummary}</span>}
                 {selectedNode.toolCall.status === "failed" && (
-                  <button type="button" onClick={() => onRetryTool(selectedNode.id)}>
-                    Retry tool
+                  <button
+                    type="button"
+                    onClick={() => void handleRetryTool(selectedNode.id)}
+                    disabled={selectedRetryState?.status === "pending"}
+                  >
+                    {selectedRetryState?.status === "pending" ? "Retrying..." : "Retry tool"}
                   </button>
                 )}
+                {selectedRetryState && <span className={`retry-feedback ${selectedRetryState.status}`}>{selectedRetryState.message}</span>}
               </div>
             )}
             {selectedNode.evidence && selectedNode.status !== "excluded" && (

@@ -173,7 +173,31 @@ export function parseProviderJson(text) {
 
 export function normalizeProviderResult(protocol, data, latencyMs) {
   const text = extractProviderText(protocol, data);
-  const parsed = parseProviderJson(text);
+  if (!text) {
+    throw new Error("Provider returned empty content");
+  }
+  let parsed;
+  let parseError = null;
+  try {
+    parsed = parseProviderJson(text);
+  } catch (error) {
+    parseError = error instanceof Error ? error.message : "Provider response was not valid JSON";
+  }
+  if (parseError) {
+    return {
+      summary: text.slice(0, 240),
+      sections: [{
+        id: "section-provider-raw",
+        title: "Provider draft",
+        body: text,
+        sourceNodeIds: []
+      }],
+      rawUsage: data?.usage ?? null,
+      latencyMs,
+      format: "raw_markdown_recovered",
+      parseError
+    };
+  }
   const sections = Array.isArray(parsed.sections)
     ? parsed.sections.map((section, index) => ({
         id: String(section.id || `section-${index + 1}`),
@@ -186,7 +210,8 @@ export function normalizeProviderResult(protocol, data, latencyMs) {
     summary: String(parsed.summary || text.slice(0, 240)),
     sections,
     rawUsage: data?.usage ?? null,
-    latencyMs
+    latencyMs,
+    format: "json"
   };
 }
 

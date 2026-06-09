@@ -13,7 +13,7 @@ export default async function handler(req, res) {
 
   try {
     const payload = await createRunSnapshot(req.body ?? {}, {
-      allowDemoFallback: true,
+      allowDemoFallback: req.body?.runMode === "live" ? false : true,
       forceDemoTools: process.env.LOADING_MIND_FORCE_DEMO_TOOLS === "1"
     });
     res.status(200).json({

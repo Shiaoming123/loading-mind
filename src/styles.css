@@ -29,9 +29,10 @@
 html,
 body,
 #root {
-  width: 100%;
+  width: 100dvw;
   min-width: 320px;
   height: 100%;
+  min-height: 100dvh;
   margin: 0;
 }
 
@@ -45,6 +46,8 @@ button {
 
 .app-shell {
   position: relative;
+  width: 100dvw;
+  min-width: 100dvw;
   min-height: 100svh;
   overflow: hidden;
   background:
@@ -54,25 +57,12 @@ button {
   isolation: isolate;
 }
 
-.app-shell.mode-system {
-  background:
-    linear-gradient(rgba(47, 43, 37, 0.028) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(47, 43, 37, 0.022) 1px, transparent 1px),
-    radial-gradient(circle at 64% 34%, rgba(141, 199, 192, 0.18), transparent 30%),
-    linear-gradient(135deg, #f8f4ec 0%, #ece3d5 100%);
-  background-size:
-    48px 48px,
-    48px 48px,
-    auto,
-    auto;
-}
-
 .mindstream-canvas,
 .grain {
   position: fixed;
   inset: 0;
-  width: 100%;
-  height: 100%;
+  width: 100dvw;
+  height: 100dvh;
 }
 
 .mindstream-canvas {
@@ -139,7 +129,6 @@ button {
 .brand small,
 .stage-text small,
 .task-pill,
-.final-panel span,
 .meter-row {
   font-family: "Avenir Next", "Helvetica Neue", sans-serif;
 }
@@ -337,7 +326,7 @@ button {
   bottom: 38px;
   display: grid;
   gap: 16px;
-  width: min(470px, calc(100vw - 68px));
+  width: min(470px, calc(100dvw - 68px));
   max-height: calc(100svh - 156px);
   overflow: auto;
   padding: 24px;
@@ -397,8 +386,7 @@ button {
   gap: 10px;
 }
 
-.task-composer .composer-actions button,
-.final-actions button {
+.task-composer .composer-actions button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -441,39 +429,6 @@ button {
   display: flex;
   justify-content: flex-end;
   gap: 9px;
-}
-
-.mode-switch {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  width: 142px;
-  height: 38px;
-  border: 1px solid rgba(47, 43, 37, 0.14);
-  border-radius: 999px;
-  padding: 3px;
-  background: rgba(248, 244, 236, 0.48);
-  backdrop-filter: blur(18px);
-}
-
-.mode-switch button {
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  color: rgba(47, 43, 37, 0.54);
-  cursor: pointer;
-  font-family: "Avenir Next", "Helvetica Neue", sans-serif;
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  transition:
-    background 180ms ease,
-    color 180ms ease,
-    box-shadow 180ms ease;
-}
-
-.mode-switch button.active {
-  background: rgba(255, 252, 244, 0.78);
-  color: var(--graphite);
-  box-shadow: 0 7px 20px rgba(47, 43, 37, 0.09);
 }
 
 .icon-button {
@@ -529,7 +484,10 @@ button {
   z-index: 7;
   right: 34px;
   top: 236px;
-  width: min(330px, calc(100vw - 68px));
+  width: min(330px, calc(100dvw - 68px));
+  max-height: calc(100svh - 264px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border: 1px solid rgba(47, 43, 37, 0.12);
   border-radius: 18px;
   padding: 20px 22px 22px;
@@ -541,6 +499,17 @@ button {
   color: var(--graphite);
   pointer-events: auto;
   text-shadow: 0 1px 0 rgba(255, 252, 244, 0.9);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(217, 130, 43, 0.42) rgba(255, 252, 244, 0.28);
+}
+
+.node-inspector::-webkit-scrollbar {
+  width: 7px;
+}
+
+.node-inspector::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(217, 130, 43, 0.36);
 }
 
 .inspector-close {
@@ -576,6 +545,7 @@ button {
   color: var(--graphite-soft);
   font-size: 13px;
   line-height: 1.7;
+  overflow-wrap: anywhere;
 }
 
 .node-inspector dl {
@@ -597,6 +567,7 @@ button {
   margin: 4px 0 0;
   color: var(--graphite);
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .node-inspector ul {
@@ -632,6 +603,8 @@ button {
   border-left: 1px solid rgba(47, 43, 37, 0.1);
   padding-left: 10px;
   line-height: 1.45;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .inspector-meta em,
@@ -651,6 +624,8 @@ button {
   padding-left: 12px;
   color: var(--graphite-soft);
   font-size: 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .inspector-report-link strong {
@@ -681,8 +656,55 @@ button {
   letter-spacing: 0.04em;
 }
 
-.task-composer .composer-actions .secondary-action,
-.final-actions button:nth-child(n + 2) {
+.inspector-report-link button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.tool-debug {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.tool-debug summary {
+  width: max-content;
+  cursor: pointer;
+  color: var(--cyan-ink);
+  font-family: "Avenir Next", "Helvetica Neue", sans-serif;
+  font-size: 11px;
+}
+
+.tool-debug pre {
+  max-height: 180px;
+  max-width: 100%;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid rgba(47, 43, 37, 0.1);
+  border-radius: 8px;
+  padding: 9px;
+  background: rgba(255, 252, 244, 0.68);
+  color: rgba(47, 43, 37, 0.72);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.retry-feedback {
+  border-left: 1px solid rgba(47, 43, 37, 0.12);
+  padding-left: 9px;
+}
+
+.retry-feedback.succeeded {
+  color: var(--cyan-ink);
+}
+
+.retry-feedback.failed {
+  color: #7a1209;
+}
+
+.task-composer .composer-actions .secondary-action {
   border: 1px solid rgba(47, 43, 37, 0.16);
   background: rgba(255, 252, 244, 0.68);
   color: var(--graphite);
@@ -721,6 +743,7 @@ button {
   white-space: nowrap;
 }
 
+.run-mode-switch,
 .protocol-switch {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -731,6 +754,7 @@ button {
   background: rgba(248, 244, 236, 0.48);
 }
 
+.run-mode-switch button,
 .protocol-switch button {
   border: 0;
   border-radius: 999px;
@@ -742,6 +766,7 @@ button {
   letter-spacing: 0.08em;
 }
 
+.run-mode-switch button.active,
 .protocol-switch button.active {
   background: rgba(255, 252, 244, 0.82);
   color: var(--graphite);
@@ -770,6 +795,7 @@ button {
   align-items: baseline;
   color: var(--graphite-soft);
   font-size: 12px;
+  min-width: 0;
 }
 
 .node-inspector li strong {
@@ -781,35 +807,102 @@ button {
   text-transform: uppercase;
 }
 
-.final-panel {
+.node-inspector li span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.report-drawer {
   position: fixed;
-  z-index: 5;
+  z-index: 8;
   right: 34px;
   top: 82px;
-  width: min(480px, calc(100vw - 68px));
+  width: min(420px, calc(100dvw - 68px));
   max-height: calc(100svh - 112px);
   overflow: auto;
-  padding: 28px 30px;
+  padding: 22px 24px;
   border-left: 1px solid rgba(217, 130, 43, 0.58);
-  background: rgba(255, 252, 244, 0.66);
+  background: rgba(255, 252, 244, 0.78);
   box-shadow: 0 26px 80px rgba(47, 43, 37, 0.12);
   backdrop-filter: blur(22px);
 }
 
-.final-panel span {
+.report-drawer.expanded {
+  width: min(620px, calc(100dvw - 68px));
+}
+
+.report-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.report-drawer-header > span {
   color: var(--amber);
   font-size: 11px;
   letter-spacing: 0.18em;
 }
 
-.final-panel h2 {
+.report-drawer-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.report-drawer-actions button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid rgba(47, 43, 37, 0.14);
+  border-radius: 50%;
+  background: rgba(255, 252, 244, 0.72);
+  color: var(--graphite);
+  cursor: pointer;
+}
+
+.report-drawer h2 {
   margin: 14px 0 10px;
   font-size: 24px;
   font-weight: 560;
   line-height: 1.25;
 }
 
-.final-panel p {
+.markdown-body {
+  color: var(--graphite-soft);
+  font-size: 13px;
+  line-height: 1.75;
+}
+
+.markdown-body :where(h1, h2, h3) {
+  margin: 14px 0 8px;
+  color: var(--graphite);
+  font-size: 16px;
+}
+
+.markdown-body :where(p, ul, ol, pre, table) {
+  margin: 0 0 10px;
+}
+
+.markdown-body :where(ul, ol) {
+  padding-left: 18px;
+}
+
+.markdown-body code {
+  border-radius: 4px;
+  padding: 1px 4px;
+  background: rgba(47, 43, 37, 0.07);
+}
+
+.markdown-body pre {
+  overflow-x: auto;
+  border: 1px solid rgba(47, 43, 37, 0.1);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(255, 252, 244, 0.62);
+}
+
+.report-drawer p {
   margin: 0;
   color: var(--graphite-soft);
   line-height: 1.75;
@@ -838,6 +931,72 @@ button {
   color: var(--graphite);
   cursor: pointer;
   font-size: 11px;
+}
+
+.report-preview {
+  display: grid;
+  gap: 16px;
+  margin-top: 18px;
+  border-top: 1px solid rgba(47, 43, 37, 0.1);
+  padding-top: 16px;
+}
+
+.report-preview-group {
+  display: grid;
+  gap: 8px;
+}
+
+.report-preview-group > span {
+  color: var(--amber);
+  font-family: "Avenir Next", "Helvetica Neue", sans-serif;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.report-preview-item {
+  display: grid;
+  gap: 5px;
+  width: 100%;
+  border: 1px solid rgba(47, 43, 37, 0.1);
+  border-left-color: rgba(62, 133, 129, 0.4);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: rgba(255, 252, 244, 0.48);
+  color: var(--graphite);
+  cursor: pointer;
+  text-align: left;
+}
+
+.report-preview-item:disabled {
+  cursor: default;
+}
+
+.report-preview-item small {
+  color: var(--cyan-ink);
+  font-family: "Avenir Next", "Helvetica Neue", sans-serif;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.report-preview-item strong {
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 1.35;
+}
+
+.report-preview-item span {
+  color: var(--graphite-soft);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.report-preview-item em {
+  color: rgba(47, 43, 37, 0.46);
+  font-size: 10px;
+  font-style: normal;
+  line-height: 1.45;
 }
 
 .report-blocks {
@@ -920,6 +1079,27 @@ button {
   line-height: 1.6;
 }
 
+.mermaid-render,
+.mermaid-fallback {
+  overflow-x: auto;
+  border: 1px solid rgba(47, 43, 37, 0.1);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(255, 252, 244, 0.58);
+}
+
+.mermaid-render svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.mermaid-fallback {
+  display: grid;
+  gap: 8px;
+  color: var(--graphite-soft);
+  font-size: 12px;
+}
+
 .claim-graph-block {
   display: grid;
   grid-template-columns: 72px 72px 1fr;
@@ -990,23 +1170,6 @@ button {
   letter-spacing: 0.06em;
 }
 
-.final-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 20px;
-}
-
-.final-panel > button {
-  margin-top: 20px;
-  border: 1px solid rgba(47, 43, 37, 0.16);
-  border-radius: 999px;
-  padding: 11px 15px;
-  background: var(--graphite);
-  color: var(--ivory);
-  cursor: pointer;
-}
-
 @media (max-width: 980px) {
   body {
     overflow: auto;
@@ -1024,7 +1187,7 @@ button {
   .telemetry,
   .force-nebula,
   .task-composer,
-  .final-panel {
+  .report-drawer {
     position: relative;
     inset: auto;
     width: auto;
@@ -1134,7 +1297,7 @@ button {
     margin-top: 26px;
   }
 
-  .final-panel {
+  .report-drawer {
     margin-top: 18px;
     margin-bottom: 26px;
     max-height: none;

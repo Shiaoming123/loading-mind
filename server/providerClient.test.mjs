@@ -57,6 +57,29 @@ describe("providerClient", () => {
     expect(result.sections).toHaveLength(1);
     expect(result.rawUsage.total_tokens).toBe(123);
     expect(result.latencyMs).toBe(42);
+    expect(result.format).toBe("json");
+  });
+
+  it("recovers non-empty non-JSON provider text into markdown sections", () => {
+    const result = normalizeProviderResult("openai", {
+      choices: [{
+        message: {
+          content: "# Draft report\n\n- Non-strict provider output"
+        }
+      }],
+      usage: { total_tokens: 88 }
+    }, 37);
+
+    expect(result.format).toBe("raw_markdown_recovered");
+    expect(result.parseError).toMatch(/not valid JSON/i);
+    expect(result.sections).toEqual([{
+      id: "section-provider-raw",
+      title: "Provider draft",
+      body: "# Draft report\n\n- Non-strict provider output",
+      sourceNodeIds: []
+    }]);
+    expect(result.rawUsage.total_tokens).toBe(88);
+    expect(result.latencyMs).toBe(37);
   });
 
   it("handles fenced JSON, empty content, and model discovery", () => {

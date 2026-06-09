@@ -27,6 +27,7 @@ function fallbackRun(request: CreateRunRequest): AgentRun {
     scope: request.scope,
     depth: request.depth,
     sources: request.sources,
+    runMode: request.runMode,
     provider: {
       protocol: request.providerConfig.protocol,
       baseUrl: request.providerConfig.baseUrl,
@@ -132,8 +133,10 @@ export function useMindstream() {
       source.onerror = () => {
         source.close();
         eventSourceRef.current = null;
-        if (state.agentEvents.length === 0) {
+        if (state.agentEvents.length === 0 && request.runMode === "demo") {
           startRecordedFallback(request);
+        } else if (state.agentEvents.length === 0) {
+          dispatch({ type: "FAIL", error: "Live event stream failed before receiving runtime events." });
         }
       };
     },
@@ -163,8 +166,15 @@ export function useMindstream() {
           dispatch({ type: "START", run: payload.run });
           subscribeToRun(payload.run, request);
         }
-      } catch {
-        startRecordedFallback(request);
+      } catch (error) {
+        if (request.runMode === "demo") {
+          startRecordedFallback(request);
+        } else {
+          dispatch({
+            type: "FAIL",
+            error: error instanceof Error ? error.message : "Live run service failed before creating a run."
+          });
+        }
       }
     },
     [clearFallback, closeEventSource, replayServerEvents, startRecordedFallback, subscribeToRun]
@@ -195,6 +205,7 @@ export function useMindstream() {
       scope: state.run.scope,
       depth: state.run.depth,
       sources: state.run.sources,
+      runMode: state.run.runMode ?? "demo",
       providerConfig: defaultRunRequest().providerConfig
     } : defaultRunRequest());
   }, [state.run, submitTask]);
@@ -204,11 +215,24 @@ export function useMindstream() {
       if (!state.run) {
         return;
       }
-      await fetch(`/api/runs/${state.run.id}/retry`, {
+      const response = await fetch(`/api/runs/${state.run.id}/retry`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ toolNodeId })
-      }).catch(() => undefined);
+      });
+      const text = await response.text();
+      let payload: { message?: string; error?: string } = {};
+      if (text) {
+        try {
+          payload = JSON.parse(text) as { message?: string; error?: string };
+        } catch {
+          payload = { message: text };
+        }
+      }
+      if (!response.ok) {
+        throw new Error(payload.error || payload.message || `Retry returned ${response.status}`);
+      }
+      return payload;
     },
     [state.run]
   );

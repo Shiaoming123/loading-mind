@@ -56,6 +56,7 @@ Vercel endpoints:
 
 Default public run interface:
 
+- `runMode: "demo"` for stable sandbox playback or `"live"` for real tool execution
 - `researchMode: "demo_deep_research"`
 - `sourceBudget: 12` with a hard cap of 12
 - `visualization: "auto"`
@@ -63,8 +64,13 @@ Default public run interface:
 Useful environment variables:
 
 - `LOADING_MIND_PROVIDER_API_KEY`, `MIMO_API_KEY`, or `OPENAI_API_KEY` supplies the provider key server-side.
+- `TAVILY_API_KEY` enables Live search through Tavily.
 - `LOADING_MIND_DEMO_MODE=1` allows demo fallback observations when external tools are unavailable.
 - `LOADING_MIND_FORCE_DEMO_TOOLS=1` forces built-in demo tool outputs for public trial stability.
+
+Demo mode keeps sandbox fallbacks available for a stable public presentation. Live mode disables silent demo fallbacks: if Tavily, web fetch, or the configured provider fails, the run records visible failed tool nodes and stops or degrades according to the runtime failure rules.
+
+In local development, the Tavily key can be provided either through `.env.local` or the Tavily Search API Key field in the run configuration form. The form value is used only for the submitted run and is not written into run metadata.
 
 Local development still uses the Vite middleware and SSE runtime so pause, resume, cancel, retry, and exclude interactions remain available while iterating.
 
@@ -75,7 +81,7 @@ Local development still uses the Vite middleware and SSE runtime so pause, resum
 3. Click a node to inspect summary, attributes, episodes, source refs, tool input/output, and report mapping.
 4. Pause/resume/cancel the run from the control cluster.
 5. Retry a failed tool node or exclude an evidence node from the inspector.
-6. When the long report appears, inspect the table of contents, source matrix, cross-check table, Mermaid structure, and claim graph.
+6. When the long report appears, open the right-side report drawer to inspect rendered Markdown, source matrix, cross-check table, Mermaid structure, and claim graph.
 7. Click a section or block to highlight the source graph path.
 
 ## Design Intent

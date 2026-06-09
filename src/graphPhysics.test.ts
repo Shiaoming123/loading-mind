@@ -178,6 +178,16 @@ describe("graphPhysics", () => {
     expect(written.stroke).not.toBe(observed.stroke);
   });
 
+  it("keeps idle node glow much quieter than active or failed nodes", () => {
+    const idle = nodeRenderToken({ id: "source", kind: "source", label: "Source", status: "observed" });
+    const active = nodeRenderToken({ id: "source", kind: "source", label: "Source", status: "observed" }, true);
+    const failed = nodeRenderToken({ id: "failed", kind: "tool_call", label: "Failed", status: "failed" });
+
+    expect(idle.haloAlpha).toBeLessThan(active.haloAlpha);
+    expect(idle.haloScale).toBeLessThan(active.haloScale);
+    expect(idle.haloAlpha).toBeLessThan(failed.haloAlpha);
+  });
+
   it("aggregates duplicate semantic edges into one visible edge", () => {
     const edges = [
       normalizeEdge({ id: "extract", from: "task-brief", to: "ontology-schema", kind: "extracts" }),

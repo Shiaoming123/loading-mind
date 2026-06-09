@@ -1,10 +1,12 @@
-import type { AgentEvent, AgentRun, LoadingEvent, ProviderConfig } from "./types";
+import type { AgentEvent, AgentRun, LoadingEvent, ProviderConfig, RunMode } from "./types";
 
 export type CreateRunRequest = {
   question: string;
   scope: string;
   depth: AgentRun["depth"];
   sources: string[];
+  runMode: RunMode;
+  tavilyApiKey?: string;
   providerConfig: ProviderConfig;
   researchMode?: "demo_deep_research";
   sourceBudget?: number;
@@ -34,6 +36,8 @@ export function defaultRunRequest(): CreateRunRequest {
     scope: "面向 AI Product Builder 面试 Demo，强调真实工具调用、过程图谱和最终报告映射。",
     depth: "standard",
     sources: ["web_search", "web_fetch", "document_read"],
+    runMode: "demo",
+    tavilyApiKey: "",
     researchMode: "demo_deep_research",
     sourceBudget: 12,
     visualization: "auto",

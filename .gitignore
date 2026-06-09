@@ -2,6 +2,8 @@ node_modules/
 dist/
 .codegraph/
 .playwright-cli/
+.codex-temp/
 .agent-runs/
+.env.local
 .DS_Store
 npm-debug.log*

@@ -1,13 +1,14 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { Download, FlaskConical, Pause, Play, RotateCcw, Send, Sparkles, Square } from "lucide-react";
+import { FlaskConical, Pause, Play, RotateCcw, Send, Square } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { defaultRunRequest } from "./agentProtocol";
 import { getPhaseIndex, phases } from "./demoData";
 import { ForceNebulaGraph } from "./ForceNebulaGraph";
 import { computeSceneInsets } from "./graphPhysics";
 import { MindstreamCanvas } from "./MindstreamCanvas";
+import { ReportDrawer } from "./ReportDrawer";
 import { useMindstream } from "./useMindstream";
-import type { ArtifactBlock, GraphSceneSnapshot, LoadingPhase, ProviderConfig, ProviderProtocol, VisualMode } from "./types";
+import type { GraphSceneSnapshot, LoadingPhase, ProviderConfig, ProviderProtocol, RunMode } from "./types";
 
 const phaseCopy: Record<LoadingPhase, string> = {
   initializing: "任务 seed 正在建立",
@@ -50,82 +51,66 @@ function maskedProvider(provider: ProviderConfig) {
   return key ? `${key.slice(0, 6)}...${key.slice(-3)}` : "API key required";
 }
 
-function sourceLabel(sourceNodeIds: string[] = []) {
-  return sourceNodeIds.slice(0, 5).join(" / ");
+const localRuntimeSettingsKey = "loading-mind.runtime-settings";
+
+type LocalRuntimeSettings = {
+  tavilyApiKey?: string;
+  providerConfig?: Partial<ProviderConfig>;
+};
+
+function readLocalRuntimeSettings(): LocalRuntimeSettings {
+  try {
+    const raw = window.localStorage.getItem(localRuntimeSettingsKey);
+    return raw ? JSON.parse(raw) as LocalRuntimeSettings : {};
+  } catch {
+    return {};
+  }
 }
 
-function ReportBlock({
-  block,
-  onFocusSource
-}: {
-  block: ArtifactBlock;
-  onFocusSource: (nodeId: string | null) => void;
-}) {
-  const firstSource = block.sourceNodeIds?.[0] ?? null;
-  return (
-    <section className={`report-block block-${block.type}`}>
-      <button
-        className="report-block-focus"
-        type="button"
-        onClick={() => onFocusSource(firstSource)}
-        disabled={!firstSource}
-      >
-        {block.title ?? "Report block"}
-      </button>
-      {block.type === "markdown" && <p>{block.body}</p>}
-      {(block.type === "table" || block.type === "source_matrix") && (
-        <div className="report-table-wrap">
-          <table>
-            <thead>
-              <tr>
-                {block.columns.map((column) => <th key={column}>{column}</th>)}
-              </tr>
-            </thead>
-            <tbody>
-              {block.rows.map((row, index) => (
-                <tr key={`${block.id}-${index}`}>
-                  {block.columns.map((column) => <td key={column}>{String(row[column] ?? "")}</td>)}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-      {block.type === "mermaid" && <pre className="mermaid-block">{block.code}</pre>}
-      {block.type === "claim_graph" && (
-        <div className="claim-graph-block">
-          <div>
-            <strong>{block.nodes.length}</strong>
-            <span>nodes</span>
-          </div>
-          <div>
-            <strong>{block.edges.length}</strong>
-            <span>edges</span>
-          </div>
-          <p>{block.nodes.slice(0, 5).map((node) => node.label).join(" / ")}</p>
-        </div>
-      )}
-      {block.sourceNodeIds && block.sourceNodeIds.length > 0 && <em>{sourceLabel(block.sourceNodeIds)}</em>}
-    </section>
-  );
+function writeLocalRuntimeSettings(settings: LocalRuntimeSettings) {
+  try {
+    window.localStorage.setItem(localRuntimeSettingsKey, JSON.stringify(settings));
+  } catch {
+    // Local persistence is a convenience; unavailable storage should not block a run.
+  }
+}
+
+function savedProviderConfig(fallback: ProviderConfig) {
+  const saved = readLocalRuntimeSettings().providerConfig ?? {};
+  return {
+    ...fallback,
+    ...saved
+  };
 }
 
 export function App() {
   const { state, submitTask, pause, resume, cancel, retryTool, excludeEvidence } = useMindstream();
-  const [particlesEnabled, setParticlesEnabled] = useState(false);
-  const [visualMode, setVisualMode] = useState<VisualMode>("cinematic");
+  const [runMode, setRunMode] = useState<RunMode>(defaultRunRequest().runMode);
   const [scene, setScene] = useState<GraphSceneSnapshot>(emptyScene);
   const [viewport, setViewport] = useState({ width: 1440, height: 900 });
   const [reportFocusNodeId, setReportFocusNodeId] = useState<string | null>(null);
   const [taskDraft, setTaskDraft] = useState(defaultRunRequest().question);
   const [scopeDraft, setScopeDraft] = useState(defaultRunRequest().scope);
-  const [providerConfig, setProviderConfig] = useState<ProviderConfig>(defaultRunRequest().providerConfig);
+  const [tavilyApiKey, setTavilyApiKey] = useState(() => readLocalRuntimeSettings().tavilyApiKey ?? defaultRunRequest().tavilyApiKey ?? "");
+  const [providerConfig, setProviderConfig] = useState<ProviderConfig>(() => savedProviderConfig(defaultRunRequest().providerConfig));
   const [calibrationQueue, setCalibrationQueue] = useState<string[]>([]);
   const [calibrationIndex, setCalibrationIndex] = useState<number | null>(null);
   const currentPhaseIndex = getPhaseIndex(state.phase);
   const progress = state.status === "completed" ? 100 : Math.min(98, Math.round((state.elapsed / 30000) * 100));
   const latestEvent = state.events[state.events.length - 1];
   const finalArtifact = state.finalReport;
+  const sourceLabelMap = useMemo(() => {
+    const labels: Record<string, string> = {};
+    for (const node of state.graphNodes) {
+      if (node.label.trim()) {
+        labels[node.id] = node.label;
+      }
+    }
+    return {
+      ...labels,
+      ...finalArtifact?.sourceLabelMap
+    };
+  }, [finalArtifact?.sourceLabelMap, state.graphNodes]);
   const sceneInsets = useMemo(() => computeSceneInsets(viewport), [viewport]);
   const centerHeadline = state.status === "failed" ? "运行失败，需要处理工具错误" : phaseCopy[state.phase];
   const centerEventLine = state.status === "failed" && state.error
@@ -137,15 +122,22 @@ export function App() {
 
   useEffect(() => {
     const syncViewport = () => {
+      const visualViewport = window.visualViewport;
       setViewport({
-        width: window.innerWidth,
-        height: window.innerHeight
+        width: visualViewport?.width ?? window.innerWidth,
+        height: visualViewport?.height ?? window.innerHeight
       });
     };
 
     syncViewport();
     window.addEventListener("resize", syncViewport);
-    return () => window.removeEventListener("resize", syncViewport);
+    window.visualViewport?.addEventListener("resize", syncViewport);
+    window.visualViewport?.addEventListener("scroll", syncViewport);
+    return () => {
+      window.removeEventListener("resize", syncViewport);
+      window.visualViewport?.removeEventListener("resize", syncViewport);
+      window.visualViewport?.removeEventListener("scroll", syncViewport);
+    };
   }, []);
 
   useEffect(() => {
@@ -154,6 +146,13 @@ export function App() {
     }
   }, [state.status]);
 
+  useEffect(() => {
+    writeLocalRuntimeSettings({
+      tavilyApiKey,
+      providerConfig
+    });
+  }, [providerConfig, tavilyApiKey]);
+
   const handleReplay = useCallback(() => {
     setReportFocusNodeId(null);
     submitTask({
@@ -161,9 +160,11 @@ export function App() {
       scope: state.run?.scope ?? (scopeDraft.trim() || defaultRunRequest().scope),
       depth: state.run?.depth ?? "standard",
       sources: state.run?.sources ?? ["web_search", "web_fetch", "document_read"],
+      runMode: state.run?.runMode ?? runMode,
+      tavilyApiKey,
       providerConfig
     });
-  }, [providerConfig, scopeDraft, state.run, submitTask, taskDraft]);
+  }, [providerConfig, runMode, scopeDraft, state.run, submitTask, taskDraft, tavilyApiKey]);
 
   const updateProvider = useCallback(<Key extends keyof ProviderConfig>(key: Key, value: ProviderConfig[Key]) => {
     setProviderConfig((current) => ({ ...current, [key]: value }));
@@ -174,8 +175,10 @@ export function App() {
     scope,
     depth: "standard" as const,
     sources: ["web_search", "web_fetch", "document_read"],
+    runMode,
+    tavilyApiKey,
     providerConfig
-  }), [providerConfig, scopeDraft]);
+  }), [providerConfig, runMode, scopeDraft, tavilyApiKey]);
 
   const handleSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -187,8 +190,8 @@ export function App() {
 
   const handleStartCalibration = useCallback(() => {
     setReportFocusNodeId(null);
-    const [firstTopic, ...remainingTopics] = calibrationTopics;
-    setCalibrationQueue(remainingTopics);
+    const [firstTopic] = calibrationTopics;
+    setCalibrationQueue([]);
     setCalibrationIndex(1);
     setTaskDraft(firstTopic);
     setScopeDraft("完整长跑校准：验证真实 API 调用、工具观察分析、报告生成和导出链路。");
@@ -196,19 +199,11 @@ export function App() {
   }, [buildRequest, submitTask]);
 
   useEffect(() => {
-    if (state.status !== "completed" || calibrationQueue.length === 0 || calibrationIndex === null) {
-      return;
+    if (state.status === "completed") {
+      setCalibrationQueue([]);
+      setCalibrationIndex(null);
     }
-    const [nextTopic, ...remainingTopics] = calibrationQueue;
-    const timer = window.setTimeout(() => {
-      setReportFocusNodeId(null);
-      setCalibrationQueue(remainingTopics);
-      setCalibrationIndex((index) => index === null ? null : index + 1);
-      setTaskDraft(nextTopic);
-      submitTask(buildRequest(nextTopic, "完整长跑校准：验证真实 API 调用、工具观察分析、报告生成和导出链路。"));
-    }, 900);
-    return () => window.clearTimeout(timer);
-  }, [buildRequest, calibrationIndex, calibrationQueue, state.status, submitTask]);
+  }, [state.status]);
 
   useEffect(() => {
     if (state.status === "failed" || state.status === "cancelled") {
@@ -227,7 +222,7 @@ export function App() {
   const isRunning = state.status === "running" || state.status === "queued";
 
   return (
-    <main className={`app-shell mode-${visualMode} phase-${state.phase}`}>
+    <main className={`app-shell phase-${state.phase}`}>
       <MindstreamCanvas
         phase={state.phase}
         status={state.status}
@@ -236,8 +231,6 @@ export function App() {
           edgeCount: state.graphEdges.length,
           clusterCount: state.formedClusters.length
         }}
-        particlesEnabled={particlesEnabled}
-        visualMode={visualMode}
         scene={scene}
       />
       <div className="grain" />
@@ -324,7 +317,7 @@ export function App() {
             exit={{ opacity: 0, y: 20, filter: "blur(10px)" }}
             transition={{ duration: 0.48, ease: [0.16, 1, 0.3, 1] }}
           >
-            <span>LIVE AGENT RUN</span>
+            <span>{runMode === "demo" ? "DEMO AGENT RUN" : "LIVE AGENT RUN"}</span>
             <label>
               <strong>Research Question</strong>
               <textarea value={taskDraft} onChange={(event) => setTaskDraft(event.target.value)} rows={4} />
@@ -334,6 +327,19 @@ export function App() {
               <input value={scopeDraft} onChange={(event) => setScopeDraft(event.target.value)} />
             </label>
             <div className="provider-config" aria-label="Provider configuration">
+              <div className="run-mode-switch" aria-label="Run mode">
+                {(["demo", "live"] as RunMode[]).map((mode) => (
+                  <button
+                    className={runMode === mode ? "active" : ""}
+                    key={mode}
+                    type="button"
+                    onClick={() => setRunMode(mode)}
+                    aria-pressed={runMode === mode}
+                  >
+                    {mode === "demo" ? "Demo" : "Live"}
+                  </button>
+                ))}
+              </div>
               <div className="provider-config-header">
                 <strong>Provider</strong>
                 <span>{providerConfig.protocol} · {providerConfig.model} · {maskedProvider(providerConfig)}</span>
@@ -387,7 +393,17 @@ export function App() {
                 </label>
               </div>
               <label>
-                <strong>API Key</strong>
+                <strong>Tavily Search API Key</strong>
+                <input
+                  autoComplete="off"
+                  placeholder="Paste Tavily key"
+                  type="password"
+                  value={tavilyApiKey}
+                  onChange={(event) => setTavilyApiKey(event.target.value)}
+                />
+              </label>
+              <label>
+                <strong>LLM API Key</strong>
                 <input
                   autoComplete="off"
                   placeholder="Paste runtime key"
@@ -400,7 +416,7 @@ export function App() {
             <div className="composer-actions">
               <button type="submit">
                 <Send size={16} />
-                Start real process
+                {runMode === "demo" ? "Start demo process" : "Start live process"}
               </button>
               <button className="secondary-action" type="button" onClick={handleStartCalibration}>
                 <FlaskConical size={16} />
@@ -423,19 +439,6 @@ export function App() {
           <motion.span animate={{ width: `${progress}%` }} transition={{ duration: 0.3 }} />
         </div>
         <div className="controls">
-          <div className="mode-switch" aria-label="Visual mode">
-            {(["cinematic", "system"] as VisualMode[]).map((mode) => (
-              <button
-                className={visualMode === mode ? "active" : ""}
-                key={mode}
-                type="button"
-                onClick={() => setVisualMode(mode)}
-                aria-pressed={visualMode === mode}
-              >
-                {mode === "cinematic" ? "Cinematic" : "System"}
-              </button>
-            ))}
-          </div>
           <button
             className="icon-button"
             type="button"
@@ -459,15 +462,6 @@ export function App() {
           <button className="icon-button" type="button" onClick={handleReplay} aria-label="Replay" title="Replay">
             <RotateCcw size={17} />
           </button>
-          <button
-            className={`icon-button ${particlesEnabled ? "active" : ""}`}
-            type="button"
-            onClick={() => setParticlesEnabled((enabled) => !enabled)}
-            aria-label={particlesEnabled ? "Disable particles" : "Enable particles"}
-            title={particlesEnabled ? "Disable particles" : "Enable particles"}
-          >
-            <Sparkles size={16} />
-          </button>
         </div>
       </section>
 
@@ -477,8 +471,6 @@ export function App() {
         formedClusters={state.formedClusters}
         emphasizedNodeId={state.emphasizedNodeId}
         status={state.status}
-        particlesEnabled={particlesEnabled}
-        visualMode={visualMode}
         sceneInsets={sceneInsets}
         reportFocusNodeId={reportFocusNodeId}
         reportSections={finalArtifact?.sections ?? []}
@@ -487,73 +479,14 @@ export function App() {
         onExcludeEvidence={excludeEvidence}
       />
 
-      <AnimatePresence>
-        {state.status === "completed" && finalArtifact && (
-          <motion.section
-            className="final-panel"
-            initial={{ opacity: 0, y: 28, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            transition={{ duration: 0.75, ease: [0.16, 1, 0.3, 1] }}
-          >
-            <span>FINAL REPORT</span>
-            <h2>{finalArtifact.title}</h2>
-            <p>{finalArtifact.body}</p>
-            {finalArtifact.sections && (
-              <nav className="report-toc" aria-label="Report table of contents">
-                {finalArtifact.sections.map((section) => (
-                  <button
-                    key={`toc-${section.id}`}
-                    type="button"
-                    onClick={() => setReportFocusNodeId(section.sourceNodeIds[0] ?? null)}
-                  >
-                    {section.title}
-                  </button>
-                ))}
-              </nav>
-            )}
-            {finalArtifact.blocks && (
-              <article className="report-blocks" aria-label="Structured report blocks">
-                {finalArtifact.blocks.map((block) => (
-                  <ReportBlock block={block} key={block.id} onFocusSource={setReportFocusNodeId} />
-                ))}
-              </article>
-            )}
-            {finalArtifact.sections && (
-              <article className="report-article" aria-label="Generated report article">
-                {finalArtifact.sections.map((section) => {
-                  const nodeId = section.sourceNodeIds[0] ?? null;
-                  return (
-                    <button
-                      className={reportFocusNodeId === nodeId ? "active" : ""}
-                      key={section.id}
-                      type="button"
-                      onClick={() => setReportFocusNodeId(nodeId)}
-                    >
-                      <strong>{section.title}</strong>
-                      <span>{section.body}</span>
-                      <em>{section.sourceNodeIds.join(" / ")}</em>
-                    </button>
-                  );
-                })}
-              </article>
-            )}
-            <div className="final-actions">
-              <button type="button" onClick={handleReplay}>
-                <RotateCcw size={15} />
-                Run again
-              </button>
-              <button type="button" onClick={() => exportRun("markdown")}>
-                <Download size={15} />
-                Markdown
-              </button>
-              <button type="button" onClick={() => exportRun("json")}>
-                <Download size={15} />
-                JSON
-              </button>
-            </div>
-          </motion.section>
-        )}
-      </AnimatePresence>
+      <ReportDrawer
+        artifact={state.status === "completed" ? finalArtifact : null}
+        focusNodeId={reportFocusNodeId}
+        onExport={exportRun}
+        onFocusSource={setReportFocusNodeId}
+        onReplay={handleReplay}
+        sourceLabelMap={sourceLabelMap}
+      />
     </main>
   );
 }

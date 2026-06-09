@@ -12,9 +12,8 @@ export type VisualIntensity = "quiet" | "focused" | "dense" | "resolved";
 
 export type ArtifactKind = "plan" | "signal" | "insight" | "draft" | "final";
 
-export type VisualMode = "cinematic" | "system";
-
 export type ResearchMode = "demo_deep_research";
+export type RunMode = "demo" | "live";
 
 export type VisualizationMode = "auto";
 
@@ -60,6 +59,7 @@ export type GraphEdgeKind =
   | "feeds_visual"
   | "observes"
   | "uses_tool"
+  | "retry_of"
   | "synthesizes"
   | "becomes_section";
 
@@ -298,6 +298,7 @@ export type Artifact = {
   body: string;
   sections?: ReportSection[];
   blocks?: ArtifactBlock[];
+  sourceLabelMap?: Record<string, string>;
 };
 
 export type LoadingEvent = {
@@ -325,6 +326,7 @@ export type AgentEventType =
   | "run_resumed"
   | "run_cancelled"
   | "run_completed"
+  | "retry_recorded"
   | "run_failed";
 
 export type AgentRun = {
@@ -333,6 +335,7 @@ export type AgentRun = {
   scope: string;
   depth: "fast" | "standard" | "deep";
   sources: string[];
+  runMode?: RunMode;
   researchMode?: ResearchMode;
   sourceBudget?: number;
   visualization?: VisualizationMode;

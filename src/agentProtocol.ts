@@ -37,7 +37,7 @@ export function agentEventToLoadingEvent(event: AgentEvent): LoadingEvent {
 
 export function defaultRunRequest(): CreateRunRequest {
   return {
-    question: "AI Agent 长链路等待过程如何设计成可检查、可追溯、可交互的过程体验？",
+    question: "我想学习 LLM 和 AI Agent 的相关知识，请生成一份深度研究报告。",
     scope: "面向 AI Product Builder 面试 Demo，强调真实工具调用、过程图谱和最终报告映射。",
     depth: "standard",
     sources: ["web_search", "web_fetch", "document_read"],

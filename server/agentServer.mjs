@@ -4915,7 +4915,7 @@ function createRun(body, options = {}) {
   const allowDemoFallback = options.allowDemoFallback ?? (runMode === "demo" || process.env.LOADING_MIND_DEMO_MODE === "1");
   const meta = {
     id: `run-${createdAt.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-    question: String(body.question || "AI Agent 长链路等待过程如何设计？"),
+    question: String(body.question || "我想学习 LLM 和 AI Agent 的相关知识，请生成一份深度研究报告。"),
     scope: String(body.scope || "AI 调研报告过程可视化"),
     depth: body.depth === "fast" || body.depth === "deep" ? body.depth : "standard",
     sources: Array.isArray(body.sources) && body.sources.length > 0 ? body.sources.map(String) : ["web_search", "web_fetch", "document_read"],

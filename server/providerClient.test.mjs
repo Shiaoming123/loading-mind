@@ -16,27 +16,60 @@ const messages = [
 ];
 
 describe("providerClient", () => {
-  it("builds OpenAI-compatible chat completion requests", () => {
+  it("builds default OpenAI-compatible chat completion requests", () => {
     const request = buildProviderRequest({
       ...providerDefaults,
+      apiKey: "sk-secret"
+    }, messages);
+
+    expect(request.url).toBe("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
+    expect(request.headers.Authorization).toBe("Bearer sk-secret");
+    expect(request.headers["api-key"]).toBeUndefined();
+    expect(request.body.model).toBe("deepseek-v4-flash");
+    expect(request.body.messages).toEqual(messages);
+    expect(request.body.max_tokens).toBe(providerDefaults.maxTokens);
+  });
+
+  it("builds MiMo Token Plan requests with api-key auth", () => {
+    const request = buildProviderRequest({
+      ...providerDefaults,
+      baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+      anthropicBaseUrl: "https://token-plan-cn.xiaomimimo.com/anthropic",
+      model: "mimo-v2.5-pro",
       apiKey: "tp-secret"
     }, messages);
 
     expect(request.url).toBe("https://token-plan-cn.xiaomimimo.com/v1/chat/completions");
-    expect(request.headers.Authorization).toBe("Bearer tp-secret");
-    expect(request.body.model).toBe("mimo-v2.5-pro");
-    expect(request.body.messages).toEqual(messages);
+    expect(request.headers["api-key"]).toBe("tp-secret");
+    expect(request.headers.Authorization).toBeUndefined();
+    expect(request.body.max_completion_tokens).toBe(providerDefaults.maxTokens);
+    expect(request.body.max_tokens).toBeUndefined();
+  });
+
+  it("keeps bearer auth for generic OpenAI-compatible providers", () => {
+    const request = buildProviderRequest({
+      ...providerDefaults,
+      baseUrl: "https://api.openai.com/v1",
+      anthropicBaseUrl: "https://api.anthropic.com",
+      apiKey: "sk-secret"
+    }, messages);
+
+    expect(request.headers.Authorization).toBe("Bearer sk-secret");
+    expect(request.headers["api-key"]).toBeUndefined();
+    expect(request.body.max_tokens).toBe(providerDefaults.maxTokens);
   });
 
   it("builds Anthropic-compatible message requests", () => {
     const request = buildProviderRequest({
       ...providerDefaults,
       protocol: "anthropic",
+      anthropicBaseUrl: "https://token-plan-cn.xiaomimimo.com/anthropic",
       apiKey: "tp-secret"
     }, messages);
 
     expect(request.url).toBe("https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages");
-    expect(request.headers["x-api-key"]).toBe("tp-secret");
+    expect(request.headers["api-key"]).toBe("tp-secret");
+    expect(request.headers["x-api-key"]).toBeUndefined();
     expect(request.body.system).toBe("system");
     expect(request.body.messages).toEqual([{ role: "user", content: "user" }]);
   });

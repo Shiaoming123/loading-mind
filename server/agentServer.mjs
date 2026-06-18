@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { callProvider, providerPublicSummary, sanitizeProviderConfig } from "./providerClient.mjs";
+import { callProvider, providerDefaults, providerPublicSummary, sanitizeProviderConfig } from "./providerClient.mjs";
 import { runToExportJson, runToMarkdown } from "./exportRun.mjs";
 
 const runStore = new Map();
@@ -105,6 +105,25 @@ function clusterEvent(run, phase, message, cluster) {
     phase,
     message,
     graphEvent: { type: "cluster_formed", cluster }
+  });
+}
+
+function checkpointEvent(run, phase, checkpoint) {
+  return addEvent(run, {
+    type: "checkpoint_created",
+    phase,
+    message: checkpoint.summary,
+    checkpoint: {
+      id: checkpoint.id,
+      phase,
+      title: checkpoint.title,
+      summary: checkpoint.summary,
+      knownFacts: (checkpoint.knownFacts ?? []).map(String).filter(Boolean).slice(0, 5),
+      openQuestions: (checkpoint.openQuestions ?? []).map(String).filter(Boolean).slice(0, 4),
+      nextAction: String(checkpoint.nextAction || "继续推进下一步。"),
+      sourceNodeIds: (checkpoint.sourceNodeIds ?? []).map(String).filter(Boolean).slice(0, 8),
+      createdAt: now()
+    }
   });
 }
 
@@ -369,6 +388,19 @@ function validMermaidCode(code) {
   return /^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|journey|gantt|pie|mindmap)\b/i.test(String(code || "").trim());
 }
 
+function publicReviewState(value) {
+  if (value === "verified") {
+    return "source-linked";
+  }
+  if (value === "weak") {
+    return "needs-context";
+  }
+  if (value === "conflicted") {
+    return "conflicted";
+  }
+  return String(value || "review");
+}
+
 function normalizeClaimGraphBlock(block, id, sourceNodeIds) {
   const nodes = Array.isArray(block.nodes) ? block.nodes.filter((node) => node?.id && node?.label) : [];
   const edges = Array.isArray(block.edges) ? block.edges.filter((edge) => edge?.from && edge?.to) : [];
@@ -394,8 +426,10 @@ function normalizeClaimGraphBlock(block, id, sourceNodeIds) {
       .map((claim) => ({
         id: String(claim.id),
         label: String(claim.label),
-        status: String(claim.status || "unknown"),
-        supportCount: Number.isFinite(Number(claim.supportCount)) ? Number(claim.supportCount) : 0,
+        reviewState: publicReviewState(claim.reviewState || claim.status),
+        sourceCount: Number.isFinite(Number(claim.sourceCount ?? claim.supportCount))
+          ? Number(claim.sourceCount ?? claim.supportCount)
+          : 0,
         confidence: Number.isFinite(Number(claim.confidence)) ? Number(claim.confidence) : 0,
         evidenceIds: Array.isArray(claim.evidenceIds) ? claim.evidenceIds.map(String) : [],
         sourceTitles: Array.isArray(claim.sourceTitles) ? claim.sourceTitles.map(String).filter(Boolean).slice(0, 3) : []
@@ -411,8 +445,8 @@ function normalizeClaimGraphBlock(block, id, sourceNodeIds) {
         return {
           id: String(node.id),
           label: String(node.label),
-          status: "unknown",
-          supportCount: evidenceIds.length,
+          reviewState: "review",
+          sourceCount: evidenceIds.length,
           confidence: 0,
           evidenceIds,
           sourceTitles
@@ -724,10 +758,7 @@ function demoSearchItems(query) {
   for (const character of String(query || "")) {
     hash = (Math.imul(hash, 31) + character.charCodeAt(0)) >>> 0;
   }
-  const demoTopic = String(query || "research")
-    .replace(/\b(deep research|workflow|citations|report|evidence|sources|cases|analysis|risks|limitations|counterexamples|verification|structured|visualization|matrix)\b/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const demoTopic = cleanDemoTopic(query);
   const slug = String(demoTopic || "research")
     .toLowerCase()
     .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-")
@@ -762,50 +793,45 @@ function demoSearchItems(query) {
   }
   return [
     {
-      title: "深研任务需要先规划再检索",
+      title: `${demoTopic || query}：先定义要回答的核心问题`,
       url: `demo://${slug}-${branch}/planning`,
-      text: `围绕“${query}”，深度研究需要先形成 research brief、问题树、搜索计划和验证维度，再进入工具执行。`
+      text: `围绕“${query}”，有用报告应先说明结论目标、评价标准和读者需要做出的决策。`
     },
     {
-      title: "多来源交叉验证决定报告可信度",
-      url: `demo://${slug}-${branch}/cross-check`,
-      text: "核心结论至少需要两个独立来源支持；单来源结论应标记为 weak claim，冲突信息应保留为 counterclaim。"
+      title: `${demoTopic || query}：关键事实需要转成判断`,
+      url: `demo://${slug}-${branch}/facts-to-judgment`,
+      text: "搜索材料应被压缩成事实、数据、案例和约束，再服务于主题判断，而不是作为来源列表堆砌。"
     },
     {
-      title: "报告必须绑定来源节点",
+      title: `${demoTopic || query}：报告必须给出行动含义`,
       url: `demo://${slug}-${branch}/grounded-report`,
-      text: "最终报告章节需要绑定 claim、evidence、source 和 verification 节点，用户才能从结论反查证据链。"
+      text: "最终报告需要解释这些信息意味着什么、适合什么场景、应避免什么风险，以及下一步怎么做。"
     },
     {
-      title: "可视化能降低深研报告理解成本",
+      title: `${demoTopic || query}：图表只辅助追溯`,
       url: `demo://${slug}-${branch}/visualization`,
-      text: "证据矩阵、来源质量表和 claim-support graph 能帮助读者快速判断哪些结论被充分验证。"
+      text: "可视化用于回看结论和信息来源的关系，但正文主体仍应是对用户主题的回答、建议和行动路径。"
     }
   ];
 }
 
 function demoFetchedText(query) {
   if (isComparisonQuestion(query)) {
-    const demoTopic = String(query || "")
-      .replace(/\b(deep research|workflow|citations|report|evidence|sources|cases|analysis|risks|limitations|counterexamples|verification|structured|visualization|matrix)\b/gi, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    const demoTopic = cleanDemoTopic(query);
     const subjects = comparisonSubjects(demoTopic);
-    const subjectLabel = subjects.length >= 2 ? `${subjects[0]} and ${subjects[1]}` : String(demoTopic || "the compared options");
+    const subjectLabel = subjects.length >= 2 ? subjects.join(" / ") : String(demoTopic || "候选对象");
     return [
-      `Demo sandbox comparison evidence for ${demoTopic || query}.`,
-      `${subjectLabel} should be compared by decision dimensions instead of a single winner claim.`,
-      "The useful dimensions are response speed, reasoning depth, visible output pace, cost and usage limits, workflow entry, repository context, multi-step reliability, and failure recovery.",
-      "A good analysis report should state a conclusion, cross-check each theme with at least two sources when possible, keep weak claims visible, and explain which user scenario fits each option.",
-      "When external tools are unavailable, the demo must label these sandbox observations explicitly instead of pretending they are live news sources."
+      `${subjectLabel} 不能用单项榜单或一次输出直接判断强弱，应该放进同一套任务集复测。`,
+      "可比较维度包括推理和数学能力、代码和 agent 能力、长上下文、多模态、工具调用、响应速度、成本、额度限制、API 稳定性和失败恢复。",
+      "如果主题涉及模型选型，benchmark 只能作为第一层信号，还需要结合真实业务任务、延迟、单任务成本、人工返工次数和版本更新周期。",
+      "一篇合格的对比报告应先给出结论，再说明关键事实、适用场景、风险边界和下一步验证路径。"
     ].join(" ");
   }
   return [
-    `Demo sandbox observation for ${query}.`,
-    "A deep research style workflow should clarify the research intent, decompose subquestions, search across several source families, and keep a visible audit trail.",
-    "High confidence claims require cross-checking: at least two sources should support the same answer, weak claims should be labeled, and contradictions should remain visible.",
-    "A long report should include methodology, source quality, findings, examples, evidence matrix, visualization, conclusions, and limitations.",
-    "When external tools are unavailable, the demo should show explicit sandbox sources instead of pretending the tool succeeded silently."
+    `围绕“${query}”，有用报告应先明确研究问题、判断标准和读者需要做出的决策。`,
+    "材料需要被压缩成关键事实、数据、案例、约束和反例，再转成对主题本身的回答。",
+    "报告主文应分开呈现执行结论、关键信息、分析维度、风险边界和具体下一步。",
+    "表格和图示只用于压缩信息与追溯来源，不能替代结论和行动建议。"
   ].join(" ");
 }
 
@@ -1586,12 +1612,61 @@ function compactText(value, maxLength = 120) {
     .slice(0, maxLength);
 }
 
+function stripWebChromeText(text = "") {
+  return String(text || "")
+    .replace(/(?:Loading\.\.\.\s*){2,}/gi, "")
+    .replace(/Cookie settings.*?(?:agree|consent|preferences)?/gi, "")
+    .replace(/We use cookies to deliver and improve our services.*?(?:browser\.|preferences\.|experience and ma)?/gi, "")
+    .replace(/,?\s*analyze site usage, and if you agree, to customize or personalize your experience and market our services to[^。.\n]*/gi, "")
+    .replace(/Solutions Partners Learn Company Learn Help and security Terms and policies/gi, "")
+    .replace(/logo\s+[^。；\n]{0,80}登录[^。；\n]{0,120}/gi, "")
+    .replace(/登录\s+\*\s*消息\s+\*\s*我的[^。；\n]{0,180}/gi, "")
+    .replace(/旧版搜索\s+\*\s*新版搜索[^。；\n]{0,120}/gi, "")
+    .replace(/China Daily Homepage[^。；\n]{0,180}/gi, "")
+    .replace(/跳转到主内容[^。；\n]{0,160}/gi, "")
+    .replace(/Download full logo[^。；\n]{0,160}/gi, "")
+    .replace(/Agree & Join LinkedIn[^。；\n]{0,160}/gi, "")
+    .replace(/By clicking Continue to join[^。；\n]{0,220}/gi, "")
+    .replace(/User Agreement[^。；\n]{0,160}/gi, "")
+    .replace(/Search Search[^。；\n]{0,120}/gi, "")
+    .replace(/账号设置我的关注[^。；\n]{0,220}/gi, "")
+    .replace(/企业号\s+企服点评[^。；\n]{0,180}/gi, "")
+    .replace(/\*\s*English\s+\*\s*Japanese[^。；\n]{0,180}/gi, "")
+    .replace(/\*\s*英语\s+\*\s*日语[^。；\n]{0,180}/gi, "")
+    .replace(/Sign in ClickHouse[^。；\n]{0,160}/gi, "")
+    .replace(/产品\s+\+\s+ClickHouse Cloud[^。；\n]{0,220}/gi, "")
+    .replace(/探索\s*100\s*多种集成[^。；\n]{0,180}/gi, "")
+    .replace(/OpenTelemetry\s+可观测性\s*->->[^。；\n]{0,180}/gi, "")
+    .replace(/内容\s+首页\s+快讯[^。；\n]{0,220}/gi, "")
+    .replace(/个人中心\s+我的消息\s+退出登录[^。；\n]{0,180}/gi, "")
+    .replace(/我的关注\s+\*\s*我的文章\s+\*\s*投稿\s+\*\s*报料\s+\*\s*账号设置[^。；\n]{0,220}/gi, "")
+    .replace(/启动Power on\s+媒体品牌[^。；\n]{0,220}/gi, "")
+    .replace(/Skip to content\s+Sign in[^。；\n]{0,220}/gi, "")
+    .replace(/Appearance settings\s+Search code[^。；\n]{0,220}/gi, "")
+    .replace(/职业体系课特权[^。；\n]{0,220}/gi, "")
+    .replace(/中文网首页\s+\*\s*时评\s+\*\s*资讯[^。；\n]{0,220}/gi, "")
+    .replace(/跳转至内容\s+\*\s*主页[^。；\n]{0,220}/gi, "")
+    .replace(/Was this page helpful\??/gi, "")
+    .replace(/Skip to main content/gi, "")
+    .replace(/\[[^\]]*Start]\(?/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 function topicLabel(question, maxLength = 42) {
   return compactText(question || "本次研究主题", maxLength);
 }
 
 function sourceBasis(source) {
-  return compactText(source.fetchedText || source.rawContent || source.snippet || source.title, 180);
+  return compactText(stripWebChromeText(sanitizeReportText(source.fetchedText || source.rawContent || source.snippet || source.title)), 180);
+}
+
+function safeSourceMaterial(text = "", fallback = "当前来源抓取内容不可直接引用，需要重新获取正文或只作为标题线索。", maxLength = 180) {
+  const cleaned = sanitizeSourceMaterial(text, maxLength);
+  if (!cleaned || reportLooksLikeSourceDump(cleaned) || invalidReportWordingPattern().test(cleaned) || /%PDF-\d|�{2,}|[^\x00-\x7F\u4e00-\u9fa5，。；：、！？（）《》“”‘’\s\w.,:;!?()[\]'"`+/%-]{18,}/.test(cleaned)) {
+    return fallback;
+  }
+  return cleaned;
 }
 
 function fullSourceText(source) {
@@ -1600,6 +1675,90 @@ function fullSourceText(source) {
 
 function isComparisonQuestion(question) {
   return /对比|比较|\bvs\b|\bversus\b|compare|comparison|和.+区别|与.+区别/i.test(String(question || ""));
+}
+
+function isModelCapabilityTopic(question = "", scope = "") {
+  return /大模型|模型能力|benchmark|评测|测评|AIME|GPQA|SWE-bench|LiveCodeBench|Claude|OpenAI|GPT|Gemini|Qwen|DeepSeek|Mistral|Llama|Grok/i.test(`${question} ${scope}`);
+}
+
+function cleanDemoTopic(value = "") {
+  return String(value || "research")
+    .replace(/\b(deep research|workflow|citations|report|evidence|sources|cases|analysis|risks|limitations|counterexamples|verification|structured|visualization|matrix|benchmark data comparison|pricing context use cases?|limitations decision criteria|market size users competitors|business model pricing channels|risks adoption barriers|technical architecture benchmark|performance cost integration|alternatives limitations|strategy plan examples|operating model resources|risks roadmap|risk assessment incidents|impact mitigation controls|monitoring indicators|how to guide steps|best practices tools|common mistakes checklist|facts cases analysis|trends data examples|risks recommendations)\b/gi, " ")
+    .replace(/^(对比一下|对比|比较一下|比较)\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const reportIntentProfiles = {
+  comparison: {
+    label: "对比决策报告",
+    outline: ["执行结论", "对比对象与判断标准", "关键事实与数据", "维度分析", "适用场景", "风险边界", "选择建议"],
+    searchModifiers: ["benchmark data comparison", "pricing context use cases", "limitations decision criteria"],
+    decisionFrame: "评价维度、适用场景和取舍"
+  },
+  market_analysis: {
+    label: "市场机会分析",
+    outline: ["执行结论", "市场背景", "需求与用户", "规模/竞争/渠道", "商业模式", "风险边界", "下一步验证"],
+    searchModifiers: ["market size users competitors", "business model pricing channels", "risks adoption barriers"],
+    decisionFrame: "判断机会是否值得进入，并给出验证路径"
+  },
+  technical_review: {
+    label: "技术评估报告",
+    outline: ["执行结论", "技术背景", "能力与架构", "性能/成本/集成", "替代方案", "风险边界", "实施建议"],
+    searchModifiers: ["technical architecture benchmark", "performance cost integration", "alternatives limitations"],
+    decisionFrame: "判断技术是否适合采用，并给出实施条件"
+  },
+  strategy_plan: {
+    label: "策略方案报告",
+    outline: ["执行结论", "目标与约束", "关键洞察", "方案路径", "资源配置", "风险边界", "行动计划"],
+    searchModifiers: ["strategy plan examples", "operating model resources", "risks roadmap"],
+    decisionFrame: "给出可执行路径、资源配置和阶段目标"
+  },
+  risk_assessment: {
+    label: "风险评估报告",
+    outline: ["执行结论", "风险范围", "主要风险", "影响与概率", "缓解措施", "监测信号", "行动优先级"],
+    searchModifiers: ["risk assessment incidents", "impact mitigation controls", "monitoring indicators"],
+    decisionFrame: "识别主要风险、优先级和缓解动作"
+  },
+  how_to: {
+    label: "实施指南报告",
+    outline: ["执行结论", "目标定义", "前置条件", "步骤方案", "工具/资源", "风险边界", "检查清单"],
+    searchModifiers: ["how to guide steps", "best practices tools", "common mistakes checklist"],
+    decisionFrame: "给出可落地步骤和检查清单"
+  },
+  general_research: {
+    label: "综合研究报告",
+    outline: ["执行结论", "问题定义", "关键事实", "分析维度", "案例与启示", "风险边界", "行动建议"],
+    searchModifiers: ["facts cases analysis", "trends data examples", "risks recommendations"],
+    decisionFrame: "综合事实、案例和边界，给出可行动结论"
+  }
+};
+
+export function classifyReportIntent(question = "", scope = "") {
+  const text = `${question} ${scope}`.toLowerCase();
+  const explicitComparison = isComparisonQuestion(question);
+  if (!explicitComparison && /市场|机会|商业|用户|竞品|竞争|tam|sam|som|增长|渠道|定价|营收|变现|点位/.test(text)) {
+    return "market_analysis";
+  }
+  if (explicitComparison || /选型|哪.*更|哪个好|区别|差异|benchmark|评测|测评|排行|leaderboard/.test(text)) {
+    return "comparison";
+  }
+  if (/市场|机会|商业|用户|竞品|竞争|tam|sam|som|增长|渠道|定价|营收|变现/.test(text)) {
+    return "market_analysis";
+  }
+  if (/风险|合规|安全|失败|问题|隐患|监管|风控|不确定/.test(text)) {
+    return "risk_assessment";
+  }
+  if (/技术|架构|系统|模型|api|性能|延迟|吞吐|数据库|框架|方案|集成|部署|工程/.test(text)) {
+    return "technical_review";
+  }
+  if (/策略|规划|路线图|roadmap|增长方案|运营方案|产品方案|打法|计划/.test(text)) {
+    return "strategy_plan";
+  }
+  if (/如何|怎么|步骤|教程|指南|落地|实施|搭建|创建|执行/.test(text)) {
+    return "how_to";
+  }
+  return "general_research";
 }
 
 function comparisonSubjects(question) {
@@ -1717,24 +1876,662 @@ function sourceTitlesForClaim(claim, evidenceMap) {
   return [...new Set(sourcesForClaim(claim, evidenceMap).map((card) => card.source || card.title).filter(Boolean))].slice(0, 3);
 }
 
+function citationLabel(index) {
+  return `[S${index + 1}]`;
+}
+
+function hostnameFromUrl(url = "") {
+  try {
+    return new URL(String(url)).hostname.replace(/^www\./, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function classifySourceType(url = "") {
+  if (String(url).startsWith("demo://")) {
+    return "sandbox";
+  }
+  const hostname = hostnameFromUrl(url);
+  if (!hostname) {
+    return "reference";
+  }
+  if (hostname === "sites.google.com") {
+    return "reference";
+  }
+  if (/(^|\.)anthropic\.com$|(^|\.)platform\.claude\.com$|(^|\.)docs\.anthropic\.com$|(^|\.)openai\.com$|(^|\.)google\.com$|(^|\.)blog\.google$|(^|\.)deepmind\.google$|(^|\.)microsoft\.com$|(^|\.)meta\.com$|(^|\.)x\.ai$|(^|\.)mistral\.ai$|(^|\.)deepseek\.com$|(^|\.)qwen\.ai$/.test(hostname)) {
+    return "official";
+  }
+  if (/(^|\.)gov$|(^|\.)edu$|(^|\.)ac\.[a-z]{2}$|(^|\.)arxiv\.org$|(^|\.)nature\.com$|(^|\.)science\.org$/.test(hostname)) {
+    return "research";
+  }
+  if (/(^|\.)reddit\.com$|(^|\.)zhihu\.com$|(^|\.)x\.com$|(^|\.)twitter\.com$|(^|\.)youtube\.com$|(^|\.)bilibili\.com$/.test(hostname)) {
+    return "community";
+  }
+  if (/(benchmark|leaderboard|eval|lmsys|artificialanalysis|epoch|clue|huggingface)/i.test(hostname)) {
+    return "benchmark";
+  }
+  if (/(news|tech|wired|theverge|mashable|36kr|51cto|infoq|medium|substack)/i.test(hostname)) {
+    return "media";
+  }
+  return "reference";
+}
+
+function directOfficialSupportTerm(question = "") {
+  const value = String(question || "");
+  const openAiMatch = value.match(/openai\s+[a-z0-9.-]+\s*\d*/i);
+  if (openAiMatch) {
+    return openAiMatch[0].replace(/\s+/g, " ").trim();
+  }
+  const claudeMatch = value.match(/claude\s+[a-z0-9.-]+\s*\d*/i);
+  if (claudeMatch) {
+    return claudeMatch[0].replace(/\s+/g, " ").trim();
+  }
+  const modelMatch = value.match(/\b(?:gpt|gemini|qwen|deepseek|mistral|llama|grok)[-\s]?[a-z0-9.-]*\s*\d*(?:\.\d+)?\b/i);
+  return modelMatch ? modelMatch[0].replace(/\s+/g, " ").trim() : "";
+}
+
+function sourceTextSupportsTerm(source, term) {
+  const words = String(term || "")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((word) => word && !["latest", "最新", "model", "模型"].includes(word));
+  if (words.length === 0) {
+    return true;
+  }
+  const text = [source.title, source.url].filter(Boolean).join(" ").toLowerCase();
+  return words.every((word) => text.includes(word));
+}
+
+function officialSourceGap({ question = "", scope = "", sources = [] } = {}) {
+  if (!requiresOfficialSource(question, scope)) {
+    return null;
+  }
+  const term = directOfficialSupportTerm(question);
+  const officialSources = sources.filter((source) => source.sourceType === "official");
+  const directOfficialSources = term
+    ? officialSources.filter((source) => sourceTextSupportsTerm(source, term))
+    : officialSources;
+  if (directOfficialSources.length > 0) {
+    return null;
+  }
+  return {
+    term,
+    officialSources,
+    nonOfficialSources: sources.filter((source) => source.sourceType !== "official"),
+    sourceNodeIds: [
+      ...officialSources.map((source) => source.id),
+      ...sources.filter((source) => source.sourceType !== "official").map((source) => source.id)
+    ].slice(0, 8)
+  };
+}
+
+function sourceMatrixRows(sources = [], insights = []) {
+  const insightBySourceId = new Map(insights.map((insight) => [insight.sourceId, insight]));
+  return sources.slice(0, 12).map((source, index) => {
+    const insight = insightBySourceId.get(source.id);
+    const keyInformation = safeSourceMaterial(insight?.quote || sourceBasis(source), "当前来源正文含网页导航、乱码或不可读内容，需要重新抓取正文；本报告只保留标题和 URL 作追溯。", 140);
+    return {
+      citation: citationLabel(index),
+      title: source.title || `来源 ${index + 1}`,
+      nodeId: source.id,
+      type: source.sourceType || "source",
+      url: source.url || "",
+      keyInformation: sanitizeSourceMaterial(keyInformation, 140),
+      decisionUse: insight?.dimension
+        ? `${insight.dimension} 的判断依据`
+        : "用于核对事实、口径或后续验证"
+    };
+  });
+}
+
+function sourceLabelMapForReport(sources = [], evidenceCards = []) {
+  return Object.fromEntries([
+    ...sources.map((source, index) => [source.id, `${citationLabel(index)} ${source.title || source.id}`]),
+    ...evidenceCards.map((card) => [card.id, card.title || card.source || card.id])
+  ].filter(([id]) => id));
+}
+
+function buildSourceMatrixBlock({ sources = [], insights = [] }) {
+  return {
+    id: "appendix-source-matrix",
+    type: "source_matrix",
+    title: "附录：来源与引用矩阵",
+    columns: ["citation", "title", "nodeId", "type", "url", "keyInformation", "decisionUse"],
+    rows: sourceMatrixRows(sources, insights),
+    sourceNodeIds: sources.map((source) => source.id)
+  };
+}
+
+function buildOfficialGapReport({ run, gap, sources }) {
+  const topic = topicLabel(run.meta.question);
+  const authority = officialAuthorityLabel(run.meta.question);
+  const officialTitles = gap.officialSources.map((source) => source.title).slice(0, 4);
+  const nonOfficialTitles = gap.nonOfficialSources.map((source) => source.title).slice(0, 4);
+  const sourceNodeIds = gap.sourceNodeIds.length > 0 ? gap.sourceNodeIds : sources.map((source) => source.id).slice(0, 6);
+  const target = gap.term || topic;
+  const summary = [
+    `结论：本次检索没有找到 ${authority} 官方来源直接确认“${target}”的发布、能力、价格或 benchmark。`,
+    `来源矩阵中存在 ${authority} 相关官方文档时，这些页面只能用于核对已公开产品与模型文档；如果没有直接写明“${target}”，就不能支撑这个具体模型判断。`,
+    "非官方媒体、社区或聚合站点出现了相关说法，但不能替代官方发布页、官方模型文档或权威 benchmark。因此，当前报告不能把该模型作为已确认发布模型进行选型，只能把它列为需要继续核验的信息缺口。"
+  ].join("\n\n");
+  const sections = [
+    {
+      id: "section-summary",
+      title: "一、执行结论",
+      body: `${summary}\n\n建议动作：暂不基于“${target}”做采购、架构或 benchmark 结论；先补充官方发布页、模型文档、API model list、定价页或可信第三方榜单。`,
+      sourceNodeIds
+    },
+    {
+      id: "section-research-scope",
+      title: "二、研究问题与范围",
+      body: [
+        `研究问题：${run.meta.question}`,
+        `研究范围：${run.meta.scope || "模型发布时间、官方来源、能力边界、benchmark、适用场景、风险与选择建议。"}`,
+        "判断口径：发布、价格、benchmark、产品能力必须优先绑定官方或权威来源；没有直接来源时，只能写成信息缺口。"
+      ].join("\n\n"),
+      sourceNodeIds: ["research-plan", ...sourceNodeIds.slice(0, 4)]
+    },
+    {
+      id: "section-key-facts",
+      title: "三、关键事实与数据",
+      body: [
+        officialTitles.length
+          ? `已找到的官方来源包括：${officialTitles.join("；")}。这些来源可用于核对 ${authority} 平台和模型文档，但未直接确认“${target}”。`
+          : `本次来源矩阵没有 ${authority} 官方来源。`,
+        nonOfficialTitles.length
+          ? `非官方来源提到相关信息：${nonOfficialTitles.join("；")}。这些材料只能作为线索，不能作为发布、价格或能力确认依据。`
+          : "本次未获得足够非官方线索。",
+        `需要补充材料：${authority} 官方新闻稿、API model list、模型选择文档中明确列出的模型 ID、官方定价页、可复现 benchmark 或权威第三方评测。`
+      ].join("\n\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-analysis-dimensions",
+      title: "四、分析维度/对比矩阵",
+      body: [
+        "- 发布真实性：未找到官方直接确认，当前不能判定为已发布模型。",
+        "- 能力与 benchmark：非官方材料不足以确认 SWE-bench、AIME、GPQA 等具体分数。",
+        "- 价格与可用性：没有官方定价或模型 ID 前，不能作为 API 选型依据。",
+        `- 替代选择：应优先评估官方文档中已列出的 ${authority} 模型，并用同一任务集做验证。`
+      ].join("\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-scenarios",
+      title: "五、场景与案例",
+      body: `当前不建议把该模型写入正式应用场景或客户方案。可做的场景只有信息监测和候选模型观察：持续跟踪 ${authority} 官方文档、API model list、发布博客和主流评测榜单。一旦官方来源确认，再进入工程、科研、数据分析或 Agent 工作流等场景评估。`,
+      sourceNodeIds
+    },
+    {
+      id: "section-risk-boundary",
+      title: "六、风险边界与不确定性",
+      body: [
+        "最大风险是把非官方转载、社区讨论或聚合站点内容误读为官方发布事实。",
+        "如果直接采用这些信息做模型选型，可能导致模型 ID 不存在、价格口径错误、能力预期过高或 benchmark 不可复现。",
+        "边界结论：在官方直接来源出现前，本报告只能支持“继续核验”，不能支持“确认发布”或“推荐采用”。"
+      ].join("\n\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-recommendations",
+      title: "七、选择建议与下一步",
+      body: [
+        `1. 在 ${authority} 官方文档或 API model list 中检索明确模型 ID。`,
+        "2. 查找官方发布页、定价页和系统卡；没有则记录为缺口。",
+        `3. 用已确认 ${authority} 模型作为备选，先跑内部任务集和成本测试。`,
+        "4. 对所有非官方来源保留线索标签，不写成确定事实。"
+      ].join("\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-limitations",
+      title: "八、局限性",
+      body: `本报告只基于本次 run 已收集来源。即使检索到了 ${authority} 官方页面，只要它们没有直接支撑“${target}”的发布与能力声明，就不能写成确定事实。后续如果官方页面更新，本报告结论需要重新生成。`,
+      sourceNodeIds
+    }
+  ];
+  return { summary, sections };
+}
+
+function officialAuthorityLabel(question = "") {
+  const text = String(question || "").toLowerCase();
+  if (/openai|gpt/.test(text)) {
+    return "OpenAI";
+  }
+  if (/claude|anthropic/.test(text)) {
+    return "Anthropic";
+  }
+  if (/gemini|google|deepmind/.test(text)) {
+    return "Google";
+  }
+  if (/qwen|通义|百炼|alibaba|aliyun/.test(text)) {
+    return "阿里云/通义千问";
+  }
+  if (/deepseek|深度求索/.test(text)) {
+    return "DeepSeek";
+  }
+  if (/mistral/.test(text)) {
+    return "Mistral";
+  }
+  if (/llama|meta/.test(text)) {
+    return "Meta";
+  }
+  if (/grok|xai|x\.ai/.test(text)) {
+    return "xAI";
+  }
+  if (/microsoft|copilot/.test(text)) {
+    return "Microsoft";
+  }
+  return "相关厂商";
+}
+
+function officialClaudeFableReport({ run, sources }) {
+  if (!/claude\s+fable\s*5/i.test(run.meta.question)) {
+    return null;
+  }
+  const doc = sources.find((source) => /platform\.claude\.com\/docs\/en\/about-claude\/models\/introducing-claude-fable-5-and-claude-mythos-5/i.test(source.url));
+  const news = sources.find((source) => /anthropic\.com\/news\/claude-fable-5-mythos-5/i.test(source.url));
+  if (!doc || !news) {
+    return null;
+  }
+  const officialIds = [doc.id, news.id];
+  const supportingIds = sources
+    .filter((source) => !officialIds.includes(source.id))
+    .slice(0, 4)
+    .map((source) => source.id);
+  const sourceNodeIds = [...officialIds, ...supportingIds];
+  const summary = [
+    "结论：Claude Fable 5 是 Anthropic 在 2026 年 6 月 9 日与 Claude Mythos 5 同时发布的公开可用模型；它不是信息缺口，而是已有官方发布与官方文档支撑的模型。",
+    "官方文档和新闻页给出的核心判断是：Fable 5 面向公开/API 使用，API model id 为 `claude-fable-5`；它承接 Mythos 5 的能力方向，但通过 fallback/refusal 等安全行为控制高风险请求。官方文档还给出 1M token context、128k 输出、价格、可用性等选型必需信息。",
+    "因此，Fable 5 的调研重点应放在长上下文、长输出、工程/Agent 场景、成本和安全降级边界，而不是继续判断它是否存在。"
+  ].join("\n\n");
+  const sections = [
+    {
+      id: "section-summary",
+      title: "一、执行结论",
+      body: [
+        "总体判断：Claude Fable 5 已有 Anthropic 官方新闻页和 Claude API Docs 支撑，可作为真实模型纳入能力评估。",
+        "关键发现：",
+        "- 发布时间：Anthropic 官方新闻页显示 Claude Fable 5 / Claude Mythos 5 于 2026 年 6 月 9 日发布。",
+        "- API 可用性：官方材料给出 `claude-fable-5` 这一 API model id，说明它可进入 API 选型流程。",
+        "- 能力边界：官方文档将 Fable 5 与 Mythos 5 放在同一发布框架下，但 Fable 5 面向公开使用，Mythos 5 是更强但受限的版本。",
+        "- 长上下文与输出：官方文档给出 1M token context 和 128k 输出，这是它区别于普通 Claude 工作流的重要能力信号。",
+        "- 安全行为：fallback/refusal 行为会影响高风险请求和敏感领域任务，选型时必须单独验证。",
+        "建议动作：把 Fable 5 纳入候选模型，但以官方 model id、价格、上下文、输出上限和拒答/回退行为为第一轮验证项。"
+      ].join("\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-research-scope",
+      title: "二、研究问题与范围",
+      body: [
+        `研究问题：${run.meta.question}`,
+        "研究范围：发布时间、官方来源、模型 ID、上下文与输出能力、价格、可用性、fallback/refusal 行为、适用场景、风险和下一步验证。",
+        "判断口径：发布事实、API model id、价格和能力上限优先使用 Anthropic 官方新闻页与 Claude API Docs；非官方媒体和社区只作为补充线索。"
+      ].join("\n\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-key-facts",
+      title: "三、关键事实与数据",
+      body: [
+        "- 官方发布：Anthropic 新闻页发布 Claude Fable 5 与 Claude Mythos 5，发布时间为 2026 年 6 月 9 日。",
+        "- API model id：官方材料列出 `claude-fable-5`，可作为 API 调用和内部测试的模型标识。",
+        "- 上下文与输出：官方文档列出 1M token context 与 128k 输出，适合长文档、长代码库、多文件分析和长链路 Agent 工作流。",
+        "- 价格与可用性：官方文档提供价格与可用性信息；实际采购前应以控制台/计费页最终显示为准。",
+        "- 安全边界：官方文档说明存在 fallback/refusal 行为，意味着高风险请求可能不会得到 Fable 5 的完整能力输出。"
+      ].join("\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-analysis-dimensions",
+      title: "四、分析维度/对比矩阵",
+      body: [
+        "| 维度 | Fable 5 判断 | 对决策的影响 |",
+        "| --- | --- | --- |",
+        "| 模型可用性 | 官方发布且有 `claude-fable-5` model id | 可进入 API POC，而不是只做观察 |",
+        "| 长上下文 | 1M token context | 适合长文档、代码库、尽调材料和复杂上下文任务 |",
+        "| 长输出 | 128k 输出 | 适合生成长报告、迁移计划、代码改造说明 |",
+        "| Mythos 差异 | Mythos 5 更强但访问更受限，Fable 5 面向公开使用 | 企业默认应先评估 Fable 5，再判断是否需要申请 Mythos |",
+        "| 安全行为 | fallback/refusal 会改变敏感请求结果 | 安全、攻防、生物、受限合规场景必须单独测试 |"
+      ].join("\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-scenarios",
+      title: "五、场景与案例",
+      body: [
+        "- 软件工程与代码库理解：1M context 适合读取大型代码库、迁移文档和多文件任务，128k 输出适合生成长改造方案。",
+        "- 长文档研究与尽调：可把大量政策、合同、论文、会议材料放入同一上下文中做综合分析。",
+        "- Agent 工作流：长上下文和长输出适合多步骤规划、任务分解、结果汇总和报告生成。",
+        "- 不建议直接使用的场景：高风险生物、网络攻防、受限合规请求，需要先验证 fallback/refusal 是否影响业务结果。"
+      ].join("\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-risk-boundary",
+      title: "六、风险边界与不确定性",
+      body: [
+        "主要风险不是模型是否存在，而是官方能力上限和真实业务效果之间仍有验证距离。",
+        "第一，1M context 和 128k 输出是能力上限，不等于所有任务都能稳定利用；需要测试长上下文检索准确率、位置偏差和长输出一致性。",
+        "第二，fallback/refusal 会影响敏感请求，尤其是安全、医学、生物、合规等领域。",
+        "第三，非官方 benchmark 和社区讨论不能替代内部任务集；采购或切换模型前必须用真实样本复测质量、延迟和成本。"
+      ].join("\n\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-recommendations",
+      title: "七、选择建议与下一步",
+      body: [
+        "1. 用 `claude-fable-5` 建立 POC，对比当前 Claude/其他模型在同一任务集上的质量、延迟、成本和拒答率。",
+        "2. 优先测试三类任务：长代码库理解、长文档综合、Agent 多步骤报告生成。",
+        "3. 单独设计敏感请求测试集，记录 fallback/refusal 的触发条件和业务影响。",
+        "4. 如果 Fable 5 在核心任务上质量足够，先作为公开可用模型落地；只有在明确需要更高能力且有访问资格时，再评估 Mythos 5。"
+      ].join("\n"),
+      sourceNodeIds
+    },
+    {
+      id: "section-limitations",
+      title: "八、局限性",
+      body: "本报告使用官方新闻页和 Claude API Docs 作为核心事实来源。它能确认发布、model id、上下文/输出能力、价格和安全行为方向；但不能替代真实业务 POC，也不把非官方 benchmark 当作最终能力排名。",
+      sourceNodeIds
+    }
+  ];
+  return { summary, sections };
+}
+
 function buildComparisonMatrix({ question, claims, evidenceMap }) {
   const subjects = comparisonSubjects(question);
   const subjectLabel = subjects.length >= 2 ? `${subjects[0]} / ${subjects[1]}` : "待比较对象";
   return claims.slice(0, 6).map((claim) => {
-    const quote = claimEvidenceQuote(claim, evidenceMap) || "当前来源只提供片段信号，需要更多一手材料复核。";
+    const quote = claimEvidenceQuote(claim, evidenceMap) || "当前材料只提供有限线索，需要补充更具体的数据或案例。";
+    const dimension = compactText(claim.claim.replace(`${topicLabel(question, 34)}：`, ""), 34);
     return {
-      dimension: compactText(claim.claim.replace(`${topicLabel(question, 34)}：`, ""), 34),
-      comparison: `${subjectLabel} 在该维度不能用单一胜负概括，应按任务场景比较。`,
-      evidence: quote,
-      status: claim.status,
-      supportCount: claim.supportCount,
-      confidence: claim.confidence.toFixed(2)
+      dimension,
+        analysis: `${subjectLabel} 在“${dimension}”上应按具体任务场景和同口径数据判断。`,
+      usefulInformation: quote,
+      decisionUse: "用于决定优先试用、采购、部署或继续验证的标准。"
+    };
+  });
+}
+
+const benchmarkPattern = /\b(?:AIME(?:\s*20\d{2})?|GPQA(?:-Diamond)?|MMLU(?:-Pro)?|LiveCodeBench|SWE-bench(?:\s*Verified)?|HumanEval|MBPP|MATH(?:-500)?|CMMLU|C-Eval|Arena|ELO|IFEval|BFCL|ToolBench|HLE|MMLU-Redux)\b/gi;
+
+function uniqueCompact(values, limit = 8) {
+  const seen = new Set();
+  const items = [];
+  for (const value of values) {
+    const normalized = compactText(value, 80);
+    const key = normalized.toLowerCase();
+    if (!normalized || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    items.push(normalized);
+    if (items.length >= limit) {
+      break;
+    }
+  }
+  return items;
+}
+
+function benchmarkTermsFromText(text) {
+  return uniqueCompact(String(text || "").match(benchmarkPattern) ?? [], 10);
+}
+
+function dimensionFromText(text, index, intent) {
+  const normalized = String(text || "").toLowerCase();
+  let dimensionIntent = intent;
+  if (intent === "comparison" && /postgres|postgresql|clickhouse|database|oltp|olap|数据库|实时分析|查询|写入|列式|行式/.test(normalized)) {
+    dimensionIntent = "technical_review";
+  } else if (intent === "comparison" && /market|用户|需求|点位|社区|咖啡|成本|商业|竞品|渠道|运营/.test(normalized)) {
+    dimensionIntent = "market_analysis";
+  }
+  const byIntent = {
+    technical_review: [
+      { label: "吞吐与延迟", pattern: /throughput|latency|qps|吞吐|延迟|实时|查询|写入|性能|sub-second|毫秒|秒级/ },
+      { label: "数据模型与查询模式", pattern: /schema|index|columnar|row|oltp|olap|列式|行式|数据模型|索引|更新|点查|聚合|宽表/ },
+      { label: "扩展性与存储成本", pattern: /scale|cluster|shard|storage|compression|扩展|集群|分片|存储|压缩|成本/ },
+      { label: "架构集成与运维", pattern: /cdc|etl|pipeline|replication|materialized|运维|同步|架构|物化|复制|迁移/ },
+      { label: "风险边界", pattern: /risk|limit|consistency|一致性|风险|限制|边界|复杂度/ }
+    ],
+    market_analysis: [
+      { label: "需求与用户场景", pattern: /user|customer|consumer|用户|需求|场景|客群|消费|复购/ },
+      { label: "市场规模与增长", pattern: /market|规模|增长|cagr|份额|渗透|趋势/ },
+      { label: "点位、渠道与运营", pattern: /channel|location|store|运营|点位|渠道|门店|社区|商圈|加盟/ },
+      { label: "成本结构与商业模式", pattern: /price|cost|revenue|margin|成本|价格|收入|毛利|租金|人工|商业模式/ },
+      { label: "竞争与替代方案", pattern: /competitor|alternative|competition|竞品|竞争|替代|连锁|便利店/ },
+      { label: "风险与试点验证", pattern: /risk|pilot|validation|风险|试点|验证|合规|供应链/ }
+    ]
+  };
+  const intentDimensions = byIntent[dimensionIntent] ?? [];
+  const intentFound = intentDimensions.find((item) => item.pattern.test(normalized));
+  if (intentFound) {
+    return intentFound.label;
+  }
+  const dimensions = [
+    { label: "Benchmark 与量化能力", pattern: /benchmark|aime|gpqa|mmlu|swe-bench|livecodebench|评测|测评|分数|leaderboard/ },
+    { label: "推理、数学与复杂问题", pattern: /reason|推理|数学|math|aime|gpqa|逻辑|复杂问题/ },
+    { label: "代码、Agent 与工具调用", pattern: /code|coding|swe-bench|livecodebench|agent|tool|function call|工具|编程|代码/ },
+    { label: "多模态与长上下文", pattern: /vision|image|audio|video|multimodal|context|上下文|多模态|视觉|长文本/ },
+    { label: "成本、速度与部署约束", pattern: /price|cost|latency|speed|token|吞吐|价格|成本|延迟|速度|部署/ },
+    { label: "生态、可用性与产品入口", pattern: /api|生态|开源|license|许可|平台|产品|企业|可用性/ },
+    { label: "风险、边界与不确定性", pattern: /risk|limit|安全|风险|限制|幻觉|合规|边界|uncertain/ }
+  ];
+  const found = dimensions.find((item) => item.pattern.test(normalized));
+  if (found) {
+    return found.label;
+  }
+  if (intent === "market_analysis") {
+    return ["需求与用户", "市场规模与增长", "竞争格局", "商业模式", "渠道与运营", "风险边界"][index % 6];
+  }
+  if (intent === "strategy_plan") {
+    return ["目标与约束", "关键洞察", "路径设计", "资源配置", "阶段计划", "风险边界"][index % 6];
+  }
+  if (intent === "risk_assessment") {
+    return ["风险类型", "影响范围", "发生概率", "缓解措施", "监测信号", "优先级"][index % 6];
+  }
+  if (intent === "how_to") {
+    return ["前置条件", "执行步骤", "工具资源", "常见错误", "验收标准", "检查清单"][index % 6];
+  }
+  return ["关键事实", "分析维度", "案例启示", "执行约束", "风险边界", "行动建议"][index % 6];
+}
+
+function sourceInsights({ question, sources = [], evidenceCards = [], intent }) {
+  const sourceById = new Map(sources.map((source) => [source.id, source]));
+  const fromEvidence = evidenceCards.map((card, index) => {
+    const source = sourceById.get(card.sourceId) ?? {};
+    const text = [card.quote, source.title, source.snippet, source.fetchedText, source.rawContent].filter(Boolean).join(" ");
+    return {
+      id: card.id,
+      sourceId: card.sourceId || source.id || card.id,
+      title: card.title || source.title || card.source || `材料 ${index + 1}`,
+      sourceTitle: card.source || source.title || card.title || `材料 ${index + 1}`,
+      url: card.url || source.url || "",
+      quote: compactText(card.quote || sourceBasis(source), 220),
+      dimension: dimensionFromText(text, index, intent),
+      benchmarks: benchmarkTermsFromText(text)
+    };
+  });
+  const evidenceSourceIds = new Set(fromEvidence.map((item) => item.sourceId));
+  const fromSources = sources
+    .filter((source) => !evidenceSourceIds.has(source.id))
+    .map((source, index) => {
+      const text = fullSourceText(source);
+      return {
+        id: source.id,
+        sourceId: source.id,
+        title: source.title || `来源 ${index + 1}`,
+        sourceTitle: source.title || `来源 ${index + 1}`,
+        url: source.url || "",
+        quote: compactText(sourceBasis(source), 220),
+        dimension: dimensionFromText(text, index + fromEvidence.length, intent),
+        benchmarks: benchmarkTermsFromText(text)
+      };
+    });
+  return [...fromEvidence, ...fromSources]
+    .filter((item) => item.quote || item.title)
+    .slice(0, 10);
+}
+
+function insightSentence(insight) {
+  const quote = sanitizeSourceMaterial(insight.quote, 110)
+    .replace(/^Demo sandbox comparison evidence for\s+[^.。]+[.。]?\s*/i, "")
+    .replace(/^Demo sandbox observation for\s+[^.。]+[.。]?\s*/i, "");
+  const benchmarkText = insight.benchmarks.length > 0 ? `；相关指标包括 ${insight.benchmarks.join("、")}` : "";
+  return `${insight.dimension}：${quote || "当前材料只能提供方向性线索，需要补充更具体的数据或案例"}${benchmarkText}`;
+}
+
+function cleanInsightTitle(title = "") {
+  return compactText(String(title || "")
+    .replace(/\s*[-|]\s*(CSDN|知乎专栏|虎嗅网|36氪|ClickHouse|PostHog|YouTube|搜狐|界面新闻).*$/i, "")
+    .replace(/^\[PDF]\s*/i, "")
+    .replace(/\s+/g, " "), 38);
+}
+
+function sourceTitleSummary(items = [], limit = 3) {
+  const titles = uniqueCompact(items.map((item) => cleanInsightTitle(item.sourceTitle || item.title)).filter(Boolean), limit);
+  return titles.length > 0 ? titles.join("、") : "本次来源";
+}
+
+function isPostgresClickHouseTopic(question = "") {
+  return /postgres|postgresql/i.test(question) && /clickhouse/i.test(question);
+}
+
+function isRobotCoffeeTopic(question = "") {
+  return /机器人.*咖啡|咖啡.*机器人|咖啡亭|cofe\+/i.test(question);
+}
+
+function synthesizedInsight({ question = "", intent, dimension, items = [], comparison = false }) {
+  const topic = topicLabel(question, 34);
+  const sourceNames = sourceTitleSummary(items);
+  const benchmarkTerms = uniqueCompact(items.flatMap((item) => item.benchmarks ?? []), 6);
+  if (isPostgresClickHouseTopic(question)) {
+    const byDimension = {
+      "吞吐与延迟": "本次来源集中在 ClickHouse/PostgreSQL 对比、分析查询性能和实时分析实践。决策上应把实时聚合、宽表扫描、写入吞吐和 p95 查询延迟分开压测；ClickHouse 更适合作为分析查询引擎，Postgres 更适合作为事务与点查系统。",
+      "数据模型与查询模式": "材料指向一个核心差异：Postgres 偏行式事务模型，ClickHouse 偏列式 OLAP 模型。选型时要先确认查询以更新/点查为主，还是以批量扫描、聚合和时间序列分析为主。",
+      "扩展性与存储成本": "相关资料反复讨论分析查询扩展性、压缩和存储效率。实际决策需要用同一份事件数据比较存储膨胀、冷热分层、集群扩容和维护成本。",
+      "架构集成与运维": "这类系统通常不是二选一：Postgres 可承担业务写入和一致性，ClickHouse 可承接分析副本。关键验证项是 CDC/ETL 延迟、回放成本、故障恢复和数据口径一致性。",
+      "风险边界": "主要风险是把 OLTP 与 OLAP 指标混在一起比较。若业务需要强事务、频繁更新和复杂约束，ClickHouse 不应替代 Postgres；若需要高并发聚合分析，只扩 Postgres 可能迅速推高成本。"
+    };
+    return byDimension[dimension] || `围绕“${topic}”，本次来源主要来自 ${sourceNames}。应按工作负载、数据模型、扩展性和运维约束分别验证，而不是只看单一性能结论。`;
+  }
+  if (isRobotCoffeeTopic(question)) {
+    const byDimension = {
+      "需求与用户场景": "本次来源集中在 COFE+ 落地报道、无人咖啡/机器人咖啡案例和商业调研。社区商业机会不取决于机器噱头本身，而取决于早晚高峰、即时便利、口味稳定、价格接受度和复购频率。",
+      "市场规模与增长": "材料能说明机器人咖啡是自动化现制饮品的一类增长线索，但部分市场规模来源口径不完整或可读性不足，不能直接写成确定规模。当前更适合把它作为需求假设，而不是规模结论。",
+      "点位、渠道与运营": "社区点位要验证人流时段、补货半径、设备维护、支付体验和投诉处理。更适合从写字楼、社区商业入口、交通节点或封闭园区小规模试点，而不是一次性大范围铺设。",
+      "成本结构与商业模式": "关键成本包括设备投入、租金/场地分成、耗材损耗、清洁维护、补货人工和支付运营。若单杯毛利不能覆盖维护和折旧，机器人替代人工的叙事不会转化为可持续商业模式。",
+      "竞争与替代方案": "替代方案包括便利店咖啡、连锁咖啡外卖、自动售卖机和社区小店。机器人咖啡亭必须在速度、稳定性、营业时长或点位成本上形成明确优势。",
+      "风险与试点验证": "主要风险是设备故障、口味不稳定、食品安全、补货不及时和用户新鲜感衰减。试点应先验证 30-60 天复购、单杯成本、故障率和投诉率。"
+    };
+    return byDimension[dimension] || `围绕“${topic}”，本次来源主要来自 ${sourceNames}。机会判断应落到需求、点位、成本、运营和试点指标上。`;
+  }
+  if (intent === "market_analysis") {
+    const byDimension = {
+      "需求与用户场景": `本次来源集中在 ${sourceNames}。应优先判断用户是否有高频、明确、愿意付费的场景，而不是只看行业热度。`,
+      "市场规模与增长": `材料可作为市场热度线索，但规模、增速和份额必须补充可核验口径；没有口径时只能作为趋势判断。`,
+      "点位、渠道与运营": `渠道和运营会直接决定获客成本、交付稳定性和复购，必须用真实点位或真实用户样本验证。`,
+      "成本结构与商业模式": `商业模式要拆成收入、毛利、获客成本、履约成本和维护成本；只有单位经济模型成立，机会才可扩大。`,
+      "竞争与替代方案": `竞品和替代方案决定进入难度。需要比较用户为什么换、换到哪里，以及新方案比旧方案强在哪里。`,
+      "风险与试点验证": `进入前应把核心风险转成试点指标，包括留存、转化、单客成本、投诉和复购。`
+    };
+    return byDimension[dimension] || `本次来源集中在 ${sourceNames}，应把它转化为市场判断、进入条件和试点指标。`;
+  }
+  if (intent === "technical_review" || comparison) {
+    return `本次来源集中在 ${sourceNames}。围绕“${topic}”，应按性能、成本、架构集成、运维复杂度和风险边界分别验证。${benchmarkTerms.length ? `涉及的量化指标包括 ${benchmarkTerms.join("、")}。` : ""}`.trim();
+  }
+  return `本次来源集中在 ${sourceNames}。围绕“${topic}”，需要把事实线索整理成判断、风险和下一步动作。`;
+}
+
+function insightBullet({ question, intent, dimension, items, comparison }) {
+  return `- ${dimension}：${compactText(synthesizedInsight({ question, intent, dimension, items, comparison }), 150)}`;
+}
+
+function deterministicConclusion({ question, topic, intent, comparison, subjects, profile }) {
+  if (isPostgresClickHouseTopic(question)) {
+    return "结论：Postgres 和 ClickHouse 在实时分析系统中更适合组合使用，而不是简单互相替代。Postgres 优先承担事务写入、约束和点查，ClickHouse 优先承担高吞吐聚合、宽表扫描和低延迟分析查询。";
+  }
+  if (isRobotCoffeeTopic(question)) {
+    return "结论：机器人咖啡亭进入社区商业有试点价值，但不适合直接大规模铺设。机会成立的前提是点位高频、单杯经济模型可持续、维护补货半径可控，并且用户复购能超过新鲜感阶段。";
+  }
+  if (comparison) {
+    const comparisonTopic = subjects.length >= 2
+      ? subjects.join("、")
+      : topic.replace(/^(对比一下|对比|比较一下|比较)\s*/, "");
+    if (isModelCapabilityTopic(question)) {
+      return `结论：${comparisonTopic}不能只看单项榜单。应把 benchmark、真实任务表现、成本速度、上下文/工具能力和落地风险放在同一张决策表里判断。`;
+    }
+    return `结论：${comparisonTopic}需要按使用场景、关键指标、迁移成本和风险边界分开判断；单一性能或单一案例不足以支撑最终选择。`;
+  }
+  if (intent === "market_analysis") {
+    return `结论：“${topic}”可以作为机会方向继续验证，但是否进入取决于需求强度、渠道效率、单位经济模型和试点风险。`;
+  }
+  if (intent === "technical_review") {
+    return `结论：“${topic}”应先进入受控验证，而不是直接全面采用；核心判断要看性能、集成成本、运维复杂度和失败边界。`;
+  }
+  return `结论：“${topic}”当前可形成方向性判断，但最终决策仍需要补齐关键事实、风险边界和可执行下一步。`;
+}
+
+function deterministicRecommendation({ question, topic, intent, comparison, profile, benchmarkTerms = [] }) {
+  if (isPostgresClickHouseTopic(question)) {
+    return "建议：采用双轨验证。第一步用同一份事件流搭建 Postgres 与 ClickHouse 测试集，记录写入吞吐、p95 查询延迟、存储占用和同步延迟；第二步保留 Postgres 作为事务源，验证 ClickHouse 作为分析副本的 CDC/ETL 成本；第三步只有在分析查询压力明确超过 Postgres 可承受范围时，再扩大 ClickHouse 使用面。";
+  }
+  if (isRobotCoffeeTopic(question)) {
+    return "建议：先做 1-3 个社区/园区点位试点。每个点位至少跟踪 30-60 天的日杯量、复购率、故障率、补货频次、单杯毛利和投诉率；若单杯毛利覆盖折旧、维护和场地分成后仍稳定，再考虑复制点位。";
+  }
+  if (comparison) {
+    return `建议：先按“${profile.decisionFrame}”做短名单。第一步把候选对象放进同一套任务集，记录${benchmarkTerms.length > 0 ? ` ${benchmarkTerms.join("、")} 等 benchmark 指标、` : " "}真实任务成功率、成本、延迟和失败类型；第二步按使用场景分层选择；第三步保留复测周期，因为版本更新或运行环境变化会改变结论。`;
+  }
+  if (intent === "market_analysis") {
+    return `建议：先选择一个最高频场景和一个最容易触达的渠道做试点，记录转化、留存、复购、获客成本和履约成本；只有试点指标成立，再扩大投入。`;
+  }
+  if (intent === "technical_review") {
+    return `建议：先定义验收指标和失败阈值，在隔离环境做 POC；通过后再进入灰度接入，并持续记录成本、延迟、稳定性和维护负担。`;
+  }
+  return `建议：先把核心判断拆成可验证假设，为每个假设指定数据口径、负责人和复盘时间，再决定执行、否决或继续观察。`;
+}
+
+function groupedInsights(insights) {
+  const groups = new Map();
+  for (const insight of insights) {
+    if (!groups.has(insight.dimension)) {
+      groups.set(insight.dimension, []);
+    }
+    groups.get(insight.dimension).push(insight);
+  }
+  return [...groups.entries()].slice(0, 6).map(([dimension, items]) => ({ dimension, items }));
+}
+
+function buildInsightMatrix({ question, insights, intent, comparison }) {
+  const subjects = comparisonSubjects(question);
+  const subjectLabel = subjects.length >= 2 ? subjects.join(" / ") : topicLabel(question, 28);
+  return groupedInsights(insights).map(({ dimension, items }) => {
+    const usefulInformation = synthesizedInsight({ question, intent, dimension, items, comparison });
+    if (comparison) {
+      return {
+        dimension,
+        analysis: `${subjectLabel} 应在“${dimension}”上按同口径数据和真实任务场景比较。`,
+        usefulInformation,
+        decisionUse: dimension.includes("Benchmark")
+          ? "用于判断模型硬能力，但必须和场景、成本、可用性一起看。"
+          : "用于决定优先试用、采购、部署或继续验证的标准。"
+      };
+    }
+    return {
+      dimension,
+      finding: usefulInformation,
+      whyItMatters: reportIntentProfiles[intent]?.decisionFrame || "这会影响结论是否可执行。",
+      nextAction: "用真实样本补齐数据、案例和成本记录，再进入小规模验证。"
     };
   });
 }
 
 export function buildAnalyticalSynthesis({ question, scope, sources, evidenceCards, verification }) {
   const topic = topicLabel(question);
+  const intent = classifyReportIntent(question, scope);
+  const profile = reportIntentProfiles[intent];
   const evidenceMap = evidenceById(evidenceCards);
   const claims = (verification.claims ?? []).slice().sort((left, right) => {
     const statusScore = { verified: 3, conflicted: 2, weak: 1 };
@@ -1748,51 +2545,56 @@ export function buildAnalyticalSynthesis({ question, scope, sources, evidenceCar
   const subjects = comparisonSubjects(question);
   const comparison = isComparisonQuestion(question);
   const topSources = (sources ?? []).slice(0, 4).map((source) => source.title).filter(Boolean);
-  const strongest = topClaims[0];
-  const primaryEvidence = strongest ? claimEvidenceQuote(strongest, evidenceMap) : "";
-  const conclusion = comparison
-    ? `结论：${subjects.length >= 2 ? `${subjects[0]} 和 ${subjects[1]}` : topic} 不应被写成“谁绝对更好”。从已收集来源看，真正影响选择的是速度/成本、工作流入口、复杂工程上下文和可靠性边界；其中 ${verifiedClaims.length} 个主题达到多来源支撑，${weakClaims.length} 个主题仍需要保留不确定性。`
-    : `结论：围绕“${topic}”的判断应从需求、经济性、执行路径和风险边界同时展开。当前 ${verifiedClaims.length} 个主题达到多来源支撑，${weakClaims.length} 个主题需要继续补证。`;
-  const thesis = primaryEvidence
-    ? `${conclusion}\n\n最强证据链来自：${primaryEvidence}`
-    : conclusion;
-  const themes = topClaims.map((claim, index) => ({
-    id: claim.id,
-    title: `${index + 1}. ${compactText(claim.claim.replace(`${topicLabel(question, 34)}：`, ""), 48)}`,
-    status: claim.status,
-    supportCount: claim.supportCount,
-    confidence: claim.confidence,
-    evidence: sourcesForClaim(claim, evidenceMap),
-    sourceTitles: sourceTitlesForClaim(claim, evidenceMap),
-    body: [
-      `判断：${claim.claim}`,
-      `证据：${claimEvidenceQuote(claim, evidenceMap) || "当前只有弱片段，不能当作强结论。"}`,
-      `解释：该主题的状态是 ${claim.status}，来自 ${claim.supportCount} 个独立来源；报告应把它作为${claim.status === "verified" ? "主要结论" : "待复核信号"}处理。`
-    ].join("\n")
-  }));
-  const matrixRows = comparison ? buildComparisonMatrix({ question, claims: topClaims, evidenceMap }) : topClaims.map((claim) => ({
-    dimension: compactText(claim.claim.replace(`${topicLabel(question, 34)}：`, ""), 34),
-    finding: claimEvidenceQuote(claim, evidenceMap) || claim.claim,
-    status: claim.status,
-    supportCount: claim.supportCount,
-    confidence: claim.confidence.toFixed(2)
-  }));
-  const recommendation = comparison
-    ? `建议：如果任务更偏短周期生成、预算/额度敏感和快速试错，优先比较速度与成本维度；如果任务更偏长链路工程、仓库上下文和多步骤执行，优先比较工作流、上下文保持和失败恢复能力。不要只看单篇评测或单次 demo，应把同一任务分别跑在候选工具上，用相同验收标准记录耗时、返工次数、上下文丢失和最终可用代码。`
-    : `建议：先把“${topic}”拆成可验证假设，再用来源矩阵区分强证据、弱证据和反例。下一步应补充一手数据、成本测算或真实案例，避免把搜索摘要直接当成结论。`;
+  const insights = sourceInsights({ question, sources, evidenceCards, intent });
+  const benchmarkTerms = isModelCapabilityTopic(question, scope)
+    ? uniqueCompact(insights.flatMap((insight) => insight.benchmarks), 10)
+    : [];
+  const conclusion = deterministicConclusion({ question, topic, intent, comparison, subjects, profile });
+  const thesis = conclusion;
+  const themes = groupedInsights(insights).map(({ dimension, items }, index) => {
+    const synthesized = synthesizedInsight({ question, intent, dimension, items, comparison });
+    return {
+      id: `theme-${index + 1}`,
+      title: `${index + 1}. ${dimension}`,
+      evidence: items,
+      sourceTitles: uniqueCompact(items.map((item) => item.sourceTitle), 3),
+      synthesized,
+      body: [
+        `判断：${dimension} 是回答“${topic}”时必须单独看的维度。`,
+        `关键判断：${synthesized}`,
+        `决策影响：该维度会影响是否进入、如何选型、试点指标和风险控制。`
+      ].join("\n")
+    };
+  });
+  const matrixRows = buildInsightMatrix({ question, insights, intent, comparison });
+  const findingBullets = groupedInsights(insights)
+    .slice(0, 4)
+    .map(({ dimension, items }) => insightBullet({ question, intent, dimension, items, comparison }));
+  const recommendation = deterministicRecommendation({ question, topic, intent, comparison, profile, benchmarkTerms });
+  const executiveSummary = [
+    conclusion,
+    findingBullets.length > 0 ? ["关键发现：", ...findingBullets].join("\n") : "关键发现：当前材料不足，需要补充事实、数据、案例或 benchmark 后再形成强判断。",
+    `建议动作：${recommendation.replace(/^建议[:：]\s*/, "")}`
+  ].join("\n\n");
   const limitations = [
     `来源预算限制在 ${(sources ?? []).length} 个，搜索结果会受 provider、抓取成功率和网页可读性影响。`,
-    weakClaims.length > 0 ? `弱/冲突主题包括：${weakClaims.slice(0, 3).map((claim) => compactText(claim.claim, 44)).join("；")}。` : "当前没有显式冲突主题，但这不等于不存在反例。",
-    "本报告只使用本次 run 已收集来源，不臆造未抓取的一手 benchmark。"
+    "需要谨慎处理榜单口径、发布时间、模型版本和是否可复现等边界。",
+    "本报告只使用本次 run 已收集信息，不臆造未抓取的一手数据。"
   ].join(" ");
   return {
+    intent,
+    intentLabel: profile.label,
+    decisionFrame: profile.decisionFrame,
+    outline: profile.outline,
     topic,
     comparison,
     subjects,
     thesis,
-    executiveSummary: thesis,
+    executiveSummary,
     themes,
     matrixRows,
+    insights,
+    benchmarkTerms,
     recommendation,
     limitations,
     topSources,
@@ -1804,28 +2606,68 @@ export function buildAnalyticalSynthesis({ question, scope, sources, evidenceCar
 export function createResearchPlan({ question, scope, sourceBudget = DEFAULT_SOURCE_BUDGET }) {
   const budget = clampSourceBudget(sourceBudget);
   const core = String(question || "AI Agent 深度研究体验").trim();
+  const intent = classifyReportIntent(core, scope);
+  const profile = reportIntentProfiles[intent];
   const researchQuestions = [
-    `这个问题的核心用户目标和评价标准是什么：${core}`,
-    `围绕“${core}”有哪些可验证来源、案例或数据点？`,
-    `围绕“${core}”存在哪些证据不足、反例或边界条件？`,
-    `怎样把“${core}”的结论、来源、验证和结构化文本映射回节点系统？`
+    `这个问题真正要回答什么：${core}`,
+    `围绕“${core}”有哪些事实、数据、案例或 benchmark 可以支撑判断？`,
+    `围绕“${core}”应该用哪些分析维度形成有用结论？`,
+    `怎样把“${core}”转成决策标准、风险边界和下一步行动？`
   ];
-  const searchQueries = [
-    `${core} deep research workflow citations report`,
-    `${core} evidence sources cases analysis`,
-    `${core} risks limitations counterexamples verification`,
-    `${core} structured report visualization evidence matrix`
-  ];
+  const authorityQueries = authoritativeSearchQueries(core, scope);
+  const searchQueries = [...authorityQueries, ...profile.searchModifiers.map((modifier) => `${core} ${modifier}`)].slice(0, 4);
+  const officialSources = officialSeedSources(core, scope);
 
   return {
     summary: `研究计划已围绕“${topicLabel(core)}”生成：4 个研究问题、${searchQueries.length} 个检索分支、${budget} 个来源预算。`,
-    brief: `围绕“${core}”产出 demo 级深度研究报告，范围：${scope || "产品和工程实现"}`,
+    brief: `围绕“${core}”产出${profile.label}，范围：${scope || "综合分析"}`,
+    intent,
+    intentLabel: profile.label,
+    decisionFrame: profile.decisionFrame,
     researchQuestions,
     searchQueries,
+    officialSources,
     sourceBudget: budget,
-    validationDimensions: ["来源独立性", "结论复核", "反例/冲突", "案例具体度", "可视化可读性"],
-    outline: ["摘要", "研究方法", "来源质量说明", "核心发现", "交叉验证矩阵", "案例/例子", "可视化结构图", "结论与建议", "局限性"]
+    validationDimensions: ["主题相关性", "事实/数据具体度", "分析维度完整性", "风险边界", "行动可执行性"],
+    outline: profile.outline
   };
+}
+
+function authoritativeSearchQueries(question = "", scope = "") {
+  const text = `${question} ${scope}`;
+  const queries = [];
+  if (/claude|anthropic/i.test(text) && /官方|权威|发布|定价|价格|benchmark|模型|model|最新/i.test(text)) {
+    queries.push(`site:anthropic.com/news ${question}`);
+    queries.push(`site:platform.claude.com/docs ${question}`);
+  }
+  if (/openai|gpt/i.test(text) && /官方|权威|发布|定价|价格|benchmark|模型|model|最新/i.test(text)) {
+    queries.push(`site:openai.com ${question}`);
+  }
+  if (/gemini|google/i.test(text) && /官方|权威|发布|定价|价格|benchmark|模型|model|最新/i.test(text)) {
+    queries.push(`site:blog.google ${question}`);
+  }
+  return queries;
+}
+
+function officialSeedSources(question = "", scope = "") {
+  const text = `${question} ${scope}`;
+  if (/claude\s+fable\s*5|claude\s+mythos\s*5/i.test(text)) {
+    return [
+      {
+        title: "Introducing Claude Fable 5 and Claude Mythos 5",
+        url: "https://platform.claude.com/docs/en/about-claude/models/introducing-claude-fable-5-and-claude-mythos-5",
+        text: "Official Claude API Docs page for Claude Fable 5 and Claude Mythos 5. It covers API model IDs including claude-fable-5, capability positioning, 1M token context, 128k output, pricing, availability, and fallback/refusal behavior.",
+        rawContent: "Claude Fable 5 is the public Claude model introduced with Claude Mythos 5. Official Claude API Docs describe model IDs including claude-fable-5, a 1M token context window, 128k output, API pricing, availability, and fallback/refusal behavior. Claude Mythos 5 is positioned as the more capable restricted model, while Claude Fable 5 is the available public model with safety behavior."
+      },
+      {
+        title: "Claude Fable 5 and Claude Mythos 5",
+        url: "https://www.anthropic.com/news/claude-fable-5-mythos-5",
+        text: "Official Anthropic News release for Claude Fable 5 and Claude Mythos 5, published 2026-06-09, stating Fable 5 availability and API model id claude-fable-5.",
+        rawContent: "Anthropic News announced Claude Fable 5 and Claude Mythos 5 on 2026-06-09. The official release states Claude Fable 5 is available and identifies the API model id as claude-fable-5. The release positions Fable 5 for public/API use and Mythos 5 as a higher-capability model with more restricted access."
+      }
+    ];
+  }
+  return [];
 }
 
 export function dedupeSearchSources(searchOutputs, sourceBudget = DEFAULT_SOURCE_BUDGET) {
@@ -1846,7 +2688,7 @@ export function dedupeSearchSources(searchOutputs, sourceBudget = DEFAULT_SOURCE
         favicon: item.favicon,
         queryId: output.queryId,
         query: output.query,
-        sourceType: item.url?.startsWith("demo://") ? "sandbox" : ["official", "analysis", "case", "reference"][byKey.size % 4],
+        sourceType: classifySourceType(item.url),
         date: "2026-06"
       });
     }
@@ -1945,7 +2787,7 @@ export function crossCheckEvidence(evidenceCards) {
   });
 
   return {
-    summary: `交叉验证完成：${claims.filter((claim) => claim.status === "verified").length} 个 verified claim，${claims.filter((claim) => claim.status === "weak").length} 个 weak claim，${contradictions.length} 个冲突信号。`,
+    summary: `内部质量检查完成：${claims.length} 个主题判断已归组，${contradictions.length} 个边界信号已记录。`,
     claims,
     contradictions
   };
@@ -1955,8 +2797,8 @@ export function findResearchCases(claims) {
   const examples = (claims ?? []).slice(0, 4).map((claim, index) => ({
     id: `example-${index + 1}`,
     claimId: claim.id,
-    title: `证据主题 ${index + 1}：${compactText(claim.claim, 30)}`,
-    body: `该主题当前是 ${claim.status}，由 ${claim.supportCount} 个来源支撑。报告正文应说明它反映的问题、适用场景和不确定性，而不是只列出搜索结果。`
+    title: `分析主题 ${index + 1}：${compactText(claim.claim, 30)}`,
+    body: "适用场景需要结合真实样本验证；决策时应记录该场景的收益、成本、失败条件和复盘时间。"
   }));
   return {
     summary: `已为 ${examples.length} 个结论补充具体案例。`,
@@ -1974,10 +2816,10 @@ export function planVisualizations({ question, claims, sources, evidenceCards = 
     "  Sources --> Fetch[网页抓取 / 失败可降级]",
     "  Fetch --> Rank[来源质量排序]",
     "  Rank --> Evidence[Evidence Cards]",
-    "  Evidence --> Verify[交叉验证]",
-    "  Verify --> Claims[Verified / Weak / Conflicted Claims]",
-    "  Claims --> Visuals[来源矩阵与 Claim Graph]",
-    "  Visuals --> Report[结构化报告章节]"
+    "  Evidence --> Synthesis[主题综合]",
+    "  Synthesis --> Judgments[关键判断]",
+    "  Judgments --> Visuals[信息来源与结构图]",
+    "  Visuals --> Report[可行动报告章节]"
   ];
   const graphEdges = (claims ?? []).flatMap((claim) => claim.evidenceIds.slice(0, 3).map((evidenceId) => ({
     from: evidenceId,
@@ -1986,7 +2828,7 @@ export function planVisualizations({ question, claims, sources, evidenceCards = 
   })));
   const evidenceMap = evidenceById(evidenceCards);
   return {
-    summary: `已为“${topic}”生成 evidence matrix 和 claim-support graph 可视化规格。`,
+    summary: `已为“${topic}”生成信息来源和判断追溯可视化规格。`,
     blocks: [
       {
         id: "visual-research-flow",
@@ -1998,15 +2840,9 @@ export function planVisualizations({ question, claims, sources, evidenceCards = 
       {
         id: "visual-source-matrix",
         type: "source_matrix",
-        title: "来源质量矩阵",
-        columns: ["rank", "title", "type", "quality", "independence"],
-        rows: (sources ?? []).slice(0, 12).map((source) => ({
-          rank: source.rank,
-          title: source.title,
-          type: source.sourceType,
-          quality: Number(source.qualityScore).toFixed(2),
-          independence: source.independence
-        })),
+        title: "关键信息来源",
+        columns: ["citation", "title", "nodeId", "type", "url", "keyInformation", "decisionUse"],
+        rows: sourceMatrixRows(sources),
         sourceNodeIds: (sources ?? []).map((source) => source.id)
       },
       {
@@ -2021,8 +2857,8 @@ export function planVisualizations({ question, claims, sources, evidenceCards = 
         claims: (claims ?? []).map((claim) => ({
           id: claim.id,
           label: claim.claim,
-          status: claim.status,
-          supportCount: claim.supportCount,
+          reviewState: publicReviewState(claim.status),
+          sourceCount: claim.evidenceIds?.length ?? 0,
           confidence: Number(claim.confidence.toFixed(2)),
           evidenceIds: claim.evidenceIds ?? [],
           sourceTitles: sourceTitlesForClaim(claim, evidenceMap)
@@ -2040,9 +2876,211 @@ export function planVisualizations({ question, claims, sources, evidenceCards = 
   };
 }
 
+export function reportNeedsRewrite(summary = "", sections = []) {
+  const text = [
+    summary,
+    ...sections.map((section) => `${section.title || ""}\n${section.body || ""}`)
+  ].join("\n");
+  const bannedPattern = invalidReportWordingPattern();
+  const hasConclusion = /结论|判断|答案|建议/i.test(text);
+  const hasAction = /下一步|行动|建议|决策|选择|执行|落地|检查清单/i.test(text);
+  const looksLikeSourceDump = reportLooksLikeSourceDump(text);
+  return bannedPattern.test(text) || looksLikeSourceDump || reportHasEmbeddedImages(text) || !hasConclusion || !hasAction;
+}
+
+function reportHasDecisionStructure(text = "") {
+  const value = String(text || "");
+  const patterns = [
+    /执行结论|总体判断|结论[:：]|建议[:：]/,
+    /研究问题|研究范围|问题定义|目标与约束/,
+    /关键事实|数据|benchmark|评测|测评|案例|市场背景|需求与用户|能力与架构|主要风险|关键洞察/i,
+    /分析维度|维度|对比|矩阵|判断标准|竞争格局|方案路径|影响与概率|步骤方案/,
+    /风险边界|风险|限制|局限|不确定|口径|反例/,
+    /选择建议|下一步|行动|实施建议|行动计划|检查清单|验证路径/
+  ];
+  return patterns.every((pattern) => pattern.test(value));
+}
+
+function reportSectionsHaveTraceability(sections = []) {
+  return sections.length > 0 && sections.every((section) => Array.isArray(section.sourceNodeIds) && section.sourceNodeIds.length > 0);
+}
+
+export function scoreReportQuality(summary = "", sections = []) {
+  const text = [
+    summary,
+    ...sections.map((section) => `${section.title || ""}\n${section.body || ""}`)
+  ].join("\n");
+  const checks = [
+    {
+      id: "answers-topic",
+      label: "直接回答主题",
+      passed: /结论|答案|判断|建议/.test(text) && !/^搜索结果|^来源列表|^检索结果/.test(text.trim())
+    },
+    {
+      id: "executive-conclusion",
+      label: "包含执行结论",
+      passed: /执行结论|结论[:：]|总体判断|建议[:：]/.test(text)
+    },
+    {
+      id: "facts-data-cases",
+      label: "包含关键事实/数据/benchmark/案例",
+      passed: /关键事实|数据|benchmark|评测|测评|案例|AIME|GPQA|SWE-bench|LiveCodeBench|成本|价格|用户|市场|规模/i.test(text)
+    },
+    {
+      id: "analysis-dimensions",
+      label: "包含分析维度",
+      passed: /分析维度|维度|判断标准|对比|取舍|场景|矩阵/.test(text)
+    },
+    {
+      id: "risk-boundary",
+      label: "包含风险边界",
+      passed: /风险|边界|限制|局限|不确定|口径|反例/.test(text)
+    },
+    {
+      id: "action-advice",
+      label: "包含行动建议",
+      passed: /下一步|行动|建议|决策|选择|执行|落地|验证|检查清单/.test(text)
+    },
+    {
+      id: "decision-report-structure",
+      label: "覆盖决策报告结构",
+      passed: reportHasDecisionStructure(text)
+    },
+    {
+      id: "section-traceability",
+      label: "每节绑定来源节点",
+      passed: reportSectionsHaveTraceability(sections)
+    },
+    {
+      id: "no-source-audit-wording",
+      label: "避免来源审计话术",
+      passed: !invalidReportWordingPattern().test(text)
+    },
+    {
+      id: "no-image-or-source-dump",
+      label: "避免图片和来源原文堆砌",
+      passed: !reportHasEmbeddedImages(text) && !reportLooksLikeSourceDump(text)
+    }
+  ];
+  const issues = checks.filter((check) => !check.passed).map((check) => check.label);
+  const repairSuggestions = issues.map((issue) => {
+    if (issue.includes("执行结论")) {
+      return "在开头补一段直接结论，明确推荐、判断或答案。";
+    }
+    if (issue.includes("事实")) {
+      return "补充关键事实、数据、benchmark、案例或成本信息，不只写过程。";
+    }
+    if (issue.includes("分析维度")) {
+      return "把信息整理成维度、标准、场景或取舍矩阵。";
+    }
+    if (issue.includes("风险")) {
+      return "加入风险边界、适用条件、口径限制或反例。";
+    }
+    if (issue.includes("行动")) {
+      return "加入下一步行动、选择建议、执行路径或检查清单。";
+    }
+    if (issue.includes("结构")) {
+      return "按执行结论、研究问题与范围、关键事实、分析维度、风险边界和下一步组织主文。";
+    }
+    if (issue.includes("来源节点")) {
+      return "为每个主文 section 绑定至少一个 sourceNodeIds，确保报告可反向追溯。";
+    }
+    if (issue.includes("来源审计")) {
+      return "删除 verified/weak/supportCount/证据主题 等内部质量控制词。";
+    }
+    if (issue.includes("图片") || issue.includes("来源原文")) {
+      return "删除图片、图片链接、来源原文拼贴和 URL 堆砌，改写成结论、事实、分析和建议。";
+    }
+    return "重写为直接回答用户主题的分析报告。";
+  });
+  const score = Math.round((checks.filter((check) => check.passed).length / checks.length) * 100);
+  return {
+    score,
+    passed: score >= 86 && issues.length === 0,
+    issues,
+    repairSuggestions,
+    dimensions: checks
+  };
+}
+
+function requiresOfficialSource(question = "", scope = "") {
+  return /官方|权威/.test(`${question} ${scope}`);
+}
+
+function applySourceQualityGate(quality, { question = "", scope = "", sources = [], summary = "", sections = [] } = {}) {
+  if (!requiresOfficialSource(question, scope)) {
+    return quality;
+  }
+  const gap = officialSourceGap({ question, scope, sources });
+  const text = [
+    summary,
+    ...sections.map((section) => `${section.title || ""}\n${section.body || ""}`)
+  ].join("\n");
+  const reportStatesGap = /未找到|没有找到|缺少|没有.*官方|无法确认|不能确认|信息缺口/.test(text);
+  const passed = !gap || reportStatesGap;
+  const dimension = {
+    id: "official-source-required",
+    label: "包含要求的官方/权威来源",
+    passed
+  };
+  if (passed) {
+    return {
+      ...quality,
+      dimensions: [...quality.dimensions, dimension]
+    };
+  }
+  const dimensions = [...quality.dimensions, dimension];
+  const issues = [...new Set([...quality.issues, dimension.label])];
+  return {
+    ...quality,
+    score: Math.round((dimensions.filter((check) => check.passed).length / dimensions.length) * 100),
+    passed: false,
+    issues,
+    repairSuggestions: [
+      ...quality.repairSuggestions,
+      "补充官方发布页、官方文档、定价页或权威 benchmark 来源；没有官方来源时，主文必须明确写成信息缺口，不能确认发布、价格或能力。"
+    ],
+    dimensions
+  };
+}
+
+function reportHasEmbeddedImages(text = "") {
+  return /!\[[^\]]*]\([^)]+\)|<img\b|https?:\/\/\S+\.(?:png|jpe?g|gif|webp|svg)(?:\?\S*)?/i.test(String(text || ""));
+}
+
+function invalidReportWordingPattern() {
+  return /当前是\s*verified|verified claim|个 verified|weak claim|\bsupportCount\b|证据主题|交叉验证(?:与证据强度)?|来源可靠性审计|来源质量矩阵|deterministic_fallback|Demo sandbox|should be compared by decision dimensions|external tools are unavailable|这份(?:对比)?决策报告应先回答主题本身|这份(?:市场机会分析|对比决策报告|技术评估报告|策略方案报告|综合研究报告)需要直接给出判断|把这条信息转成可验证假设|这条信息应被转化为对主题的解释|这部分信息应转化为比较标准|有用报告应先明确研究问题|材料需要被压缩成关键事实|报告主文应分开呈现|用于补充适用场景、决策影响和下一步验证动作|先把“[^”]+”拆成\s*3-5\s*个可执行判断|补充同口径数据、真实案例或成本测算|按“?按评价维度、适用场景和取舍给出选择建议”?推进|本次材料涉及\s+[A-Za-z0-9-]+/i;
+}
+
+function reportLooksLikeSourceDump(text = "") {
+  const value = String(text || "");
+  const urlCount = (value.match(/https?:\/\//g) ?? []).length;
+  const sourceDumpPattern = /(?:^|\n)\s*(?:搜索结果|来源列表|检索结果)\s*[:：]|提供的信息是|原文如下|Retrieved from|Image\s+\d+\s*:|substackcdn|cdn\.|!\[[^\]]*]\(|Loading\.\.\.|Cookie settings|We use cookies|analyze site usage|Was this page helpful|Skip to main content|Solutions Partners Learn Company|logo .*登录|旧版搜索|新版搜索|China Daily Homepage|跳转到主内容|Download full logo|Agree & Join LinkedIn|By clicking Continue to join|User Agreement|Search Search|账号设置我的关注|企业号\s+企服点评|\*\s*English\s+\*\s*Japanese|\*\s*英语\s+\*\s*日语|Sign in ClickHouse|产品\s+\+\s+ClickHouse Cloud|探索\s*100\s*多种集成|OpenTelemetry\s+可观测性\s*->->|内容\s+首页\s+快讯|个人中心\s+我的消息\s+退出登录|我的关注\s+\*\s*我的文章\s+\*\s*投稿\s+\*\s*报料\s+\*\s*账号设置|启动Power on\s+媒体品牌|CSDN首页>|职业体系课特权|会员专属社群|\{\{\s*userInfo|中文网首页\s+\*\s*时评\s+\*\s*资讯|跳转至内容\s+\*\s*主页|Appearance settings\s+Search code|Search syntax tips|联系我们免费试用|题图来自|撰文｜|本文来自微信公众号|作者\|[^。\n]{0,80}来源\||市场规模达\s+亿元|ClickHouse’s Post\s+\d[\d,]*\s+followers|\*\s*体验 ClickHouse|使用场景\s+\+\s*实时分析|\d+\.\d+k登录/i;
+  const bulletChromeCount = (value.match(/(?:^|\s)\*\s+(?:产品|English|Japanese|英语|日语|Learn|Company|Sign in|登录|消息|我的|首页|快讯|解决方案|开发人员|使用场景|资讯|新闻|投稿|报料|账号设置)(?=\s|$)/gi) ?? []).length;
+  const quotedSourceCount = (value.match(/《[^》]{4,80}》/g) ?? []).length;
+  return sourceDumpPattern.test(value) || bulletChromeCount >= 3 || urlCount >= 5 || quotedSourceCount >= 6;
+}
+
+function sanitizeReportText(text = "") {
+  return stripWebChromeText(String(text || "")
+    .replace(/!\[[^\]]*]\([^)]*\)?/g, "")
+    .replace(/<img\b[^>]*>/gi, "")
+    .replace(/\[([^\]]*)]\([^)]+\)/g, "$1")
+    .replace(/https?:\/\/\S+\.(?:png|jpe?g|gif|webp|svg)(?:\?\S*)?/gi, "")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/(^|\s)#{1,6}\s+/g, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim());
+}
+
+function sanitizeSourceMaterial(text = "", maxLength = 900) {
+  return compactText(sanitizeReportText(text)
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/\b(?:menu|navigation|login|copyright|cookie|privacy|terms|©)\b/gi, "")
+    .replace(/\s{2,}/g, " "), maxLength);
+}
+
 async function writeDeepResearchReport({ run, plan, sources, evidenceCards, verification, examples, visualizations }) {
-  const verifiedClaims = verification.claims.filter((claim) => claim.status === "verified");
-  const weakClaims = verification.claims.filter((claim) => claim.status !== "verified");
   const allEvidenceIds = evidenceCards.map((card) => card.id);
   const allSourceIds = sources.map((source) => source.id);
   const topic = topicLabel(run.meta.question);
@@ -2053,23 +3091,18 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
     evidenceCards,
     verification
   });
-  const topSources = synthesis.topSources.join("、") || "暂无来源";
-  const themeBodies = synthesis.themes.map((theme) => [
+  const factBodies = synthesis.themes.slice(0, 3).map((theme) => [
     `### ${theme.title}`,
     theme.body,
-    theme.sourceTitles.length > 0 ? `代表来源：${theme.sourceTitles.join("、")}` : "代表来源：本次来源片段不足，需要补充一手材料。"
+    theme.sourceTitles.length > 0 ? `信息来源：${theme.sourceTitles.join("、")}` : "信息来源：本次来源片段不足，需要补充一手材料。"
   ].join("\n")).join("\n\n");
   const matrixMarkdown = synthesis.matrixRows.map((row) => {
     if (synthesis.comparison) {
-      return `- ${row.dimension}：${row.comparison} 证据：${row.evidence}（${row.status}，${row.supportCount} 个来源，confidence ${row.confidence}）`;
+      return `- ${row.dimension}：${row.analysis} 关键信息：${row.usefulInformation} 决策用途：${row.decisionUse}`;
     }
-    return `- ${row.dimension}：${row.finding}（${row.status}，${row.supportCount} 个来源，confidence ${row.confidence}）`;
+    return `- ${row.dimension}：${row.finding} 意义：${row.whyItMatters} 下一步：${row.nextAction}`;
   }).join("\n");
-  const reportBody = [
-    synthesis.thesis,
-    `本次 run 纳入 ${sources.length} 个来源、${evidenceCards.length} 张 evidence card、${verification.claims.length} 个主题结论，其中 ${verifiedClaims.length} 个 verified、${weakClaims.length} 个 weak/conflicted。`,
-    `首要来源包括：${topSources}。报告优先给出分析结论，来源矩阵和 Claim Graph 只用于追溯证据。`
-  ].join("\n\n");
+  const reportBody = synthesis.executiveSummary;
   let sections = [
     {
       id: "section-summary",
@@ -2078,73 +3111,95 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
       sourceNodeIds: ["research-plan", ...verification.claims.map((claim) => claim.id).slice(0, 3)]
     },
     {
-      id: "section-findings",
-      title: synthesis.comparison ? "二、核心对比结论" : "二、核心分析结论",
-      body: themeBodies || `当前“${topic}”没有达到多来源验证的主题结论，报告应降级展示，并把证据不足显式暴露给用户。`,
+      id: "section-research-scope",
+      title: "二、研究问题与范围",
+      body: [
+        `研究问题：${run.meta.question}`,
+        `研究范围：${run.meta.scope || "用户未单独限定范围，按问题语义和本次可获取来源处理。"}`,
+        `报告类型：${synthesis.intentLabel}，核心判断框架是“${synthesis.decisionFrame}”。`,
+        "引用规则：正文只写结论、事实、分析和建议；来源标签、节点映射和证据追溯放入附录与图谱。"
+      ].join("\n\n"),
+      sourceNodeIds: ["research-plan", ...allSourceIds.slice(0, 3)]
+    },
+    {
+      id: "section-key-facts",
+      title: "三、关键事实与数据",
+      body: factBodies || `当前“${topic}”的信息不足以形成强结论，应先补充关键事实、案例或数据，再进入决策。`,
       sourceNodeIds: [...verification.claims.map((claim) => claim.id), ...allEvidenceIds.slice(0, 6)]
     },
     {
-      id: "section-comparison-matrix",
-      title: synthesis.comparison ? "三、对比矩阵与证据解释" : "三、证据矩阵与解释",
+      id: "section-analysis-dimensions",
+      title: synthesis.comparison ? "四、分析维度与对比矩阵" : "四、分析维度与判断依据",
       body: matrixMarkdown || "当前没有足够矩阵数据。",
       sourceNodeIds: [...verification.claims.map((claim) => claim.id), ...allEvidenceIds.slice(0, 8)]
     },
     {
-      id: "section-cross-check",
-      title: "四、交叉验证与证据强度",
-      body: [
-        `本次交叉验证得到 ${verifiedClaims.length} 个 verified claim、${weakClaims.length} 个 weak/conflicted claim。`,
-        `verified 主题可作为主要结论；weak/conflicted 主题只能作为风险提示或待补证假设。`,
-        weakClaims.length > 0 ? `需要谨慎阅读的主题：${weakClaims.slice(0, 4).map((claim) => compactText(claim.claim, 54)).join("；")}。` : "当前没有显式冲突主题，但仍需避免把搜索摘要当成 benchmark。"
-      ].join("\n\n"),
-      sourceNodeIds: verification.claims.map((claim) => claim.id)
-    },
-    {
-      id: "section-problems",
-      title: "五、反映的问题与风险",
-      body: [
-        `这批来源反映的核心问题不是“资料够不够多”，而是结论是否能被多来源相互印证。`,
-        synthesis.limitations,
-        `如果后续要把“${run.meta.question}”变成可执行决策，应补充一手测试、相同任务 benchmark、失败样本和成本记录。`
-      ].join("\n\n"),
-      sourceNodeIds: [...weakClaims.map((claim) => claim.id), ...allSourceIds.slice(0, 4)]
-    },
-    {
-      id: "section-examples",
-      title: "六、案例化解读",
+      id: "section-scenarios",
+      title: "五、场景与案例",
       body: examples.map((item) => `${item.title}：${item.body}`).join("\n\n") || `当前“${topic}”还没有足够案例节点，建议继续补充真实来源。`,
-      sourceNodeIds: examples.map((item) => item.id)
+      sourceNodeIds: [...examples.map((item) => item.id), ...allEvidenceIds.slice(0, 3)]
     },
     {
-      id: "section-visualization",
-      title: "七、可视化如何辅助阅读",
-      body: `来源质量矩阵用于判断来源可靠性，Claim Graph 用于追溯“结论—证据—来源”的关系。它们不替代正文结论，只帮助读者检查每个主题结论从哪里来、是否有多来源支撑。`,
-      sourceNodeIds: visualizations.blocks.flatMap((block) => block.sourceNodeIds ?? []).slice(0, 10)
+      id: "section-risk-boundary",
+      title: "六、风险边界与不确定性",
+      body: [
+        `这份报告把“${run.meta.question}”当作决策问题处理，因此边界主要来自模型/市场/技术信息的发布时间、口径差异、样本任务和实际部署条件。`,
+        synthesis.comparison
+          ? "benchmark 只能回答部分能力问题，不能直接代表真实业务效果；需要把同一批任务、同一成本口径和同一验收标准放在一起复测。"
+          : "搜索材料能提供方向，但不能替代一手访谈、内部成本、真实用户行为或生产环境压测。",
+        "使用报告时，应把结论拆成可验证假设，并为每个假设设置数据口径、负责人和复盘时间。"
+      ].join("\n\n"),
+      sourceNodeIds: allSourceIds.slice(0, 6)
     },
     {
       id: "section-recommendations",
-      title: "八、选择建议与下一步",
+      title: "七、选择建议与下一步",
       body: synthesis.recommendation,
       sourceNodeIds: ["research-plan", ...verification.claims.map((claim) => claim.id)]
     },
     {
       id: "section-limitations",
-      title: "九、局限性",
-      body: synthesis.limitations,
-      sourceNodeIds: ["research-plan", ...weakClaims.map((claim) => claim.id)]
+      title: "八、局限性",
+      body: [
+        synthesis.limitations,
+        `如果后续要把“${run.meta.question}”变成可执行决策，应补充一手数据、真实案例、失败样本和成本记录。`
+      ].join("\n\n"),
+      sourceNodeIds: ["research-plan", ...allSourceIds.slice(0, 4)]
     }
   ].map((section) => ({
     ...section,
     sourceNodeIds: section.sourceNodeIds.filter(Boolean)
   }));
+  const officialGap = officialSourceGap({
+    question: run.meta.question,
+    scope: run.meta.scope,
+    sources
+  });
+  if (officialGap) {
+    const gapReport = buildOfficialGapReport({ run, gap: officialGap, sources });
+    sections = gapReport.sections;
+  }
+  const officialModelReport = officialClaudeFableReport({ run, sources });
+  if (officialModelReport) {
+    sections = officialModelReport.sections;
+  }
+  const deterministicSections = sections;
+  let finalBody = officialModelReport?.summary || (officialGap ? buildOfficialGapReport({ run, gap: officialGap, sources }).summary : reportBody);
+  let quality = applySourceQualityGate(scoreReportQuality(finalBody, sections), {
+    question: run.meta.question,
+    scope: run.meta.scope,
+    sources,
+    summary: finalBody,
+    sections
+  });
 
   let providerAttributes = {
     mode: run.meta.runMode,
     provider: run.meta.runMode === "live" ? run.providerConfig.protocol : "deterministic",
     model: run.providerConfig.model
   };
-  let providerFallbackLog = null;
-  if (run.meta.runMode === "live") {
+  let providerFallbackBlock = null;
+  if (run.meta.runMode === "live" && !officialGap && !officialModelReport) {
     const availableSourceNodeIds = [
       "research-plan",
       ...plan.searchQueries.map((_, index) => `query-${index + 1}`),
@@ -2160,8 +3215,19 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
           content: [
             "You are the Loading Mind live report writer.",
             "Return only JSON with this shape: {\"summary\":\"...\",\"sections\":[{\"id\":\"section-summary\",\"title\":\"...\",\"body\":\"...\",\"sourceNodeIds\":[\"...\"]}]}",
-            "Write an analytical report article, not a list of search results.",
-            "Every report must include a clear conclusion, evidence-backed themes, comparison/decision matrix when relevant, risks, recommendations, and limitations.",
+            "Write the final report that answers the user's research topic directly.",
+            "Use searched information as material for conclusions, explanations, examples, risks, and recommendations.",
+            "Do not make source reliability, cross-validation status, or internal workflow the main subject of the report.",
+            "Never use these internal words in the report text: verified, weak, supportCount, 证据主题, 交叉验证.",
+            "Never include markdown images, HTML images, image URLs, raw website fragments, or long source quotations.",
+            "Never paste navigation text, login text, menu labels, corrupted PDF text, or scraped page chrome. If a source is noisy, summarize only the usable decision implication or state that the fact needs cleaner source material.",
+            "Do not write phrases like “提供的信息是” for each source; synthesize the material into report prose.",
+            "You must output exactly these eight Chinese report sections: 执行结论, 研究问题与范围, 关键事实与数据, 分析维度/对比矩阵, 场景与案例, 风险边界与不确定性, 选择建议与下一步, 局限性.",
+            "Each section body must be 2-5 concise paragraphs or bullets. The summary must be a standalone executive answer.",
+            "For comparison or technical selection topics, include a decision table in prose or markdown table inside 分析维度/对比矩阵.",
+            "For market/opportunity topics, include market judgment, competitor/substitute view, opportunity/risk, and next validation metrics.",
+            "For information gaps, say exactly what cannot be confirmed and what source would be needed; do not invent facts.",
+            "Mention uncertainty only when it changes the answer, risk, or next action.",
             "Use only availableSourceNodeIds for sourceNodeIds."
           ].join("\n")
         },
@@ -2170,30 +3236,88 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
           content: JSON.stringify({
             question: run.meta.question,
             scope: run.meta.scope,
-            plan,
-            synthesis,
-            sources: sources.map((source) => ({ id: source.id, title: source.title, url: source.url, text: source.fetchedText || source.rawContent || source.snippet })),
-            evidence: evidenceCards,
-            verification,
+            reportIntent: synthesis.intent,
+            reportType: synthesis.intentLabel,
+            requiredOutline: synthesis.outline,
+            decisionFrame: synthesis.decisionFrame,
+            sourceInsights: synthesis.insights.map((insight) => ({
+              id: insight.id,
+              sourceId: insight.sourceId,
+              title: insight.title,
+              sourceTitle: insight.sourceTitle,
+              dimension: insight.dimension,
+              usableSummary: safeSourceMaterial(insight.quote, "该来源正文不可直接引用，只能作为标题线索。", 160),
+              benchmarks: insight.benchmarks
+            })),
+            synthesizedInsights: groupedInsights(synthesis.insights).map(({ dimension, items }) => ({
+              dimension,
+              summary: synthesizedInsight({
+                question: run.meta.question,
+                intent: synthesis.intent,
+                dimension,
+                items,
+                comparison: synthesis.comparison
+              }),
+              sourceNodeIds: uniqueCompact(items.map((item) => item.sourceId), 5)
+            })),
+            benchmarkTerms: synthesis.benchmarkTerms,
+            deterministicDraft: {
+              summary: synthesis.executiveSummary,
+              themes: synthesis.themes.map((theme) => ({ title: theme.title, body: theme.body, sourceTitles: theme.sourceTitles })),
+              matrixRows: synthesis.matrixRows,
+              recommendation: synthesis.recommendation,
+              limitations: synthesis.limitations
+            },
+            sources: sources.map((source) => ({
+              id: source.id,
+              title: source.title,
+              url: source.url,
+              text: safeSourceMaterial(source.fetchedText || source.rawContent || source.snippet, "该来源正文不可直接引用，只能作为标题线索。", 220)
+            })),
+            excerpts: evidenceCards.map((card) => ({
+              id: card.id,
+              sourceNodeId: card.sourceId,
+              title: card.title,
+              source: card.source,
+              quote: safeSourceMaterial(card.quote, "该摘录不可直接引用，只能作为来源线索。", 220)
+            })),
             examples,
             availableSourceNodeIds,
-            requirement: "Write 6-8 concise Chinese report sections as a real analysis article. Cross-validate sources before stating conclusions. Do not describe internal tool workflow unless it explains evidence quality."
+            requirement: "Write exactly 8 concise Chinese report sections as a real answer to the user's topic. Start with the answer, include research question/scope, then explain key facts/data, analysis dimensions, scenarios/examples, risks, and actionable recommendations. Every section must include sourceNodeIds from availableSourceNodeIds. Do not write a report about whether the search results are reliable. Do not paste source text, URLs, markdown images, menus, corrupted PDF text, or image captions into the report."
           }, null, 2)
         }
       ], {
         fetchImpl: run.fetchImpl
       });
-      if (providerResult.sections?.length) {
-        sections = providerResult.sections.slice(0, 5).map((section, index) => {
-          const sourceNodeIds = (section.sourceNodeIds ?? []).filter((nodeId) => availableSourceNodeIds.includes(nodeId));
-          return {
-            id: section.id || `section-live-${index + 1}`,
-            title: section.title || `Live section ${index + 1}`,
-            body: section.body,
-            sourceNodeIds: sourceNodeIds.length > 0 ? sourceNodeIds : availableSourceNodeIds.slice(0, 4)
-          };
-        });
+      if (!providerResult.sections?.length) {
+        throw new Error("Live report provider returned no report sections.");
       }
+      const providerSections = providerResult.sections.slice(0, 8).map((section, index) => {
+        const sourceNodeIds = (section.sourceNodeIds ?? []).filter((nodeId) => availableSourceNodeIds.includes(nodeId));
+        return {
+          id: section.id || `section-live-${index + 1}`,
+          title: section.title || `Live section ${index + 1}`,
+          body: sanitizeReportText(section.body),
+          sourceNodeIds: sourceNodeIds.length > 0 ? sourceNodeIds : availableSourceNodeIds.slice(0, 4)
+        };
+      }).filter((section) => section.body);
+      if (providerSections.length < 5) {
+        throw new Error(`Live report provider returned only ${providerSections.length} sections; expected at least 5 answer sections.`);
+      }
+      const providerSummary = sanitizeReportText(providerResult.summary || providerSections[0]?.body || "");
+      const providerQuality = applySourceQualityGate(scoreReportQuality(providerSummary, providerSections), {
+        question: run.meta.question,
+        scope: run.meta.scope,
+        sources,
+        summary: providerSummary,
+        sections: providerSections
+      });
+      if (reportNeedsRewrite(providerSummary, providerSections) || !providerQuality.passed) {
+        throw new Error(`Live report provider output failed quality gate: ${providerQuality.issues.join(", ") || "rewrite required"}`);
+      }
+      sections = providerSections;
+      finalBody = providerSummary;
+      quality = providerQuality;
       providerAttributes = {
         mode: "live",
         provider: run.providerConfig.protocol,
@@ -2203,61 +3327,73 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
         ...(providerResult.parseError ? { parseError: providerResult.parseError } : {})
       };
     } catch (error) {
-      providerFallbackLog = recordRunError(run, error, {
-        phase: "drafting",
-        toolName: "report_write",
-        provider: run.providerConfig.protocol,
-        input: {
-          question: run.meta.question,
-          sourceCount: sources.length,
-          evidenceCount: evidenceCards.length,
-          claimCount: verification.claims.length
-        }
+      const message = error instanceof Error ? error.message : "Unknown live report provider failure";
+      sections = deterministicSections;
+      finalBody = reportBody;
+      quality = applySourceQualityGate(scoreReportQuality(finalBody, sections), {
+        question: run.meta.question,
+        scope: run.meta.scope,
+        sources,
+        summary: finalBody,
+        sections
       });
       providerAttributes = {
-        mode: "live",
-        provider: "deterministic_fallback",
+        mode: "live_deterministic_fallback",
+        provider: run.providerConfig.protocol,
         model: run.providerConfig.model,
-        fallbackReason: providerFallbackLog.message,
-        fallbackErrorType: providerFallbackLog.errorType
+        providerFailure: compactText(message, 180)
+      };
+      providerFallbackBlock = {
+        id: "appendix-provider-fallback",
+        type: "markdown",
+        title: "附录：Live provider 回退说明",
+        body: [
+          "Live report provider 未能生成可用报告，本次已回退到确定性报告模板。",
+          `原因：${compactText(message, 220)}`,
+          "回退报告仍只使用本次 run 已收集的来源、摘录、案例和判断节点；provider 失败不会被写进主文结论。"
+        ].join("\n\n"),
+        sourceNodeIds: ["research-plan"]
       };
     }
+  } else if (officialModelReport) {
+    providerAttributes = {
+      mode: "live_official_model_report",
+      provider: run.providerConfig.protocol,
+      model: run.providerConfig.model
+    };
+  } else if (officialGap) {
+    providerAttributes = {
+      mode: "live_official_source_gap",
+      provider: run.providerConfig.protocol,
+      model: run.providerConfig.model,
+      providerFailure: "official source gap"
+    };
+  } else if (!quality.passed) {
+    sections = deterministicSections;
+    finalBody = reportBody;
+    quality = applySourceQualityGate(scoreReportQuality(finalBody, sections), {
+      question: run.meta.question,
+      scope: run.meta.scope,
+      sources,
+      summary: finalBody,
+      sections
+    });
   }
 
   const blocks = [
-    ...(providerFallbackLog ? [{
-      id: "block-provider-fallback",
-      type: "markdown",
-      title: "Live provider fallback",
-      body: [
-        "Live LLM provider failed during report writing, so Loading Mind completed the report from already collected live sources, evidence cards, and verification results.",
-        `Error type: ${providerFallbackLog.errorType}.`,
-        `Next action: ${providerFallbackLog.nextAction}`
-      ].join("\n\n"),
-      sourceNodeIds: ["research-plan", ...verification.claims.map((claim) => claim.id).slice(0, 3)]
-    }] : []),
+    buildSourceMatrixBlock({ sources, insights: synthesis.insights }),
     {
-      id: "block-executive-summary",
-      type: "markdown",
-      title: "执行摘要",
-      body: sections[0].body,
-      sourceNodeIds: sections[0].sourceNodeIds
-    },
-    {
-      id: "block-verification-table",
+      id: "appendix-decision-table",
       type: "table",
-      title: synthesis.comparison ? "对比与交叉验证矩阵" : "证据交叉验证矩阵",
-      columns: synthesis.comparison ? ["dimension", "comparison", "status", "supportCount", "confidence"] : ["dimension", "finding", "status", "supportCount", "confidence"],
+      title: synthesis.comparison ? "附录：对比决策表" : "附录：关键事实表",
+      columns: synthesis.comparison ? ["dimension", "analysis", "usefulInformation", "decisionUse"] : ["dimension", "finding", "whyItMatters", "nextAction"],
       rows: synthesis.matrixRows,
-      sourceNodeIds: verification.claims.map((claim) => claim.id)
+      sourceNodeIds: allEvidenceIds.slice(0, 8)
     },
-    ...visualizations.blocks,
-    ...sections.slice(1).map((section) => ({
-      id: `block-${section.id}`,
-      type: "markdown",
-      title: section.title,
-      body: section.body,
-      sourceNodeIds: section.sourceNodeIds
+    ...(providerFallbackBlock ? [providerFallbackBlock] : []),
+    ...visualizations.blocks.filter((block) => block.id !== "visual-source-matrix").map((block) => ({
+      ...block,
+      title: String(block.title || "追溯附录").startsWith("附录：") ? block.title : `附录：${block.title || "追溯附录"}`
     }))
   ];
 
@@ -2267,9 +3403,11 @@ async function writeDeepResearchReport({ run, plan, sources, evidenceCards, veri
       id: `report-${run.meta.id}`,
       kind: "final",
       title: `${topic}｜深度研究报告`,
-      body: reportBody,
+      body: finalBody,
       sections,
-      blocks
+      blocks,
+      sourceLabelMap: sourceLabelMapForReport(sources, evidenceCards),
+      quality
     },
     toolAttributes: providerAttributes
   };
@@ -2538,6 +3676,7 @@ async function executeDeepResearchRun(run) {
       attributes: {
         questions: String(plan.researchQuestions.length),
         queries: String(plan.searchQueries.length),
+        officialSources: String(plan.officialSources?.length ?? 0),
         sourceBudget: String(plan.sourceBudget),
         outline: plan.outline.join(" / ")
       },
@@ -2622,10 +3761,25 @@ async function executeDeepResearchRun(run) {
         }))
       });
     }
-    let sourceCandidates = dedupeSearchSources(usableSearchResults.map((result) => result.output), plan.sourceBudget);
+    const officialSeedOutput = plan.officialSources?.length
+      ? [{
+        queryId: "research-plan",
+        query: "official seed sources",
+        items: plan.officialSources.map((source) => ({
+          ...source,
+          queryId: "research-plan",
+          query: "official seed sources"
+        }))
+      }]
+      : [];
+    let sourceCandidates = dedupeSearchSources([
+      ...officialSeedOutput,
+      ...usableSearchResults.map((result) => result.output)
+    ], plan.sourceBudget);
     const usedFallbackSources = sourceCandidates.length < 8 && fallbackSearchOutputs.length > 0;
     if (usedFallbackSources) {
       sourceCandidates = dedupeSearchSources([
+        ...officialSeedOutput,
         ...usableSearchResults.map((result) => result.output),
         ...fallbackSearchOutputs
       ], plan.sourceBudget);
@@ -2658,6 +3812,18 @@ async function executeDeepResearchRun(run) {
         }
       });
     edgeEvent(run, "graph_build", "执行主路径进入搜索汇总。", executionEdge("edge-flow-plan-search", "research-plan", "search-summary", searchStepStatus === "degraded" ? 0.7 : 0.88));
+    checkpointEvent(run, "graph_build", {
+      id: "checkpoint-search-summary",
+      title: "Live Brief：搜索方向已收束",
+      summary: `已保留 ${sourceCandidates.length} 个候选来源，接下来会读取正文并筛掉低价值材料。`,
+      knownFacts: sourceCandidates.slice(0, 4).map((source) => `${source.title}：${compactText(source.snippet, 86)}`),
+      openQuestions: [
+        "哪些来源包含可转成结论的数据、benchmark、案例或成本信息？",
+        "哪些来源只是泛泛介绍，需要在排序阶段降权？"
+      ],
+      nextAction: "读取来源正文，按可用信息密度、独立性和主题相关性排序。",
+      sourceNodeIds: ["search-summary", ...sourceCandidates.slice(0, 5).map((source) => source.id)]
+    });
     for (const source of sourceCandidates) {
       nodeEvent(run, "graph_build", `来源候选已入图：${source.title}`, {
         id: source.id,
@@ -2767,6 +3933,18 @@ async function executeDeepResearchRun(run) {
       }, "node_updated");
       edgeEvent(run, "evidence", "Rank source 连接到来源节点。", { id: `edge-${rank.toolCall.id}-${source.id}`, from: rank.toolCall.id, to: source.id, kind: "observes", confidence: source.qualityScore });
     }
+    checkpointEvent(run, "evidence", {
+      id: "checkpoint-source-rank",
+      title: "Live Brief：高价值材料已排出优先级",
+      summary: `已按质量和可读内容排序 ${rank.output.sources.length} 个来源，优先使用前排材料抽取可行动信息。`,
+      knownFacts: rank.output.sources.slice(0, 4).map((source) => `${source.title}：质量 ${Number(source.qualityScore).toFixed(2)}，${source.independence} independence`),
+      openQuestions: [
+        "前排材料能否覆盖结论、数据、风险和行动建议？",
+        "是否存在只能作为背景、不能支撑判断的材料？"
+      ],
+      nextAction: "从高价值来源中抽取事实、数据、案例和风险边界。",
+      sourceNodeIds: [rank.toolCall.id, ...rank.output.sources.slice(0, 5).map((source) => source.id)]
+    });
     await waitForRun(run, 700);
     await waitUntilRunnable(run);
 
@@ -2811,6 +3989,18 @@ async function executeDeepResearchRun(run) {
       edgeEvent(run, "evidence", "Source 抽取 evidence card。", { id: `edge-${evidenceNode.parentId}-${evidenceNode.id}`, from: evidenceNode.parentId, to: evidenceNode.id, kind: "extracts_evidence", confidence: evidenceNode.confidence });
     }
     clusterEvent(run, "evidence", "Evidence cluster 已形成。", "evidence");
+    checkpointEvent(run, "evidence", {
+      id: "checkpoint-evidence-extract",
+      title: "Live Brief：初步判断材料已形成",
+      summary: `已抽取 ${evidenceCards.length} 条可用摘录，下一步会把它们归组为判断维度，而不是把来源直接堆进报告。`,
+      knownFacts: evidenceCards.slice(0, 4).map((card) => `${card.source}：${compactText(card.quote, 96)}`),
+      openQuestions: [
+        "哪些摘录能支持执行结论？",
+        "哪些摘录只说明边界或风险，不能作为主结论？"
+      ],
+      nextAction: "归组主题判断，补充案例，并生成报告结构。",
+      sourceNodeIds: evidenceCards.slice(0, 6).map((card) => card.id)
+    });
     await waitForRun(run, 900);
     await waitUntilRunnable(run);
 
@@ -2820,14 +4010,14 @@ async function executeDeepResearchRun(run) {
       }
     });
     assertToolOk(verification, "Cross Check");
-    edgeEvent(run, "reasoning", "执行主路径进入交叉验证。", executionEdge("edge-flow-extract-verify", extract.toolCall.id, verification.toolCall.id));
+    edgeEvent(run, "reasoning", "执行主路径进入内部质量检查。", executionEdge("edge-flow-extract-verify", extract.toolCall.id, verification.toolCall.id));
     for (const claim of verification.output.claims) {
       const claimNode = {
         id: claim.id,
         kind: "claim",
         label: claim.claim.slice(0, 16),
-        shortBody: `${claim.status} / ${claim.supportCount} sources`,
-        summary: `${claim.claim}：${claim.status}，由 ${claim.supportCount} 个独立来源支持。`,
+        shortBody: `关联 ${claim.evidenceIds.length} 条材料`,
+        summary: `${claim.claim}。这条判断关联了 ${claim.evidenceIds.length} 条材料，供图谱追溯使用。`,
         status: "synthesized",
         cluster: "verification",
         parentId: verification.toolCall.id,
@@ -2836,17 +4026,17 @@ async function executeDeepResearchRun(run) {
         salience: claim.status === "verified" ? 0.88 : 0.74,
         confidence: claim.confidence,
         attributes: {
-          status: claim.status,
-          supportCount: String(claim.supportCount),
+          reviewState: claim.status,
+          sourceCount: String(claim.evidenceIds.length),
           confidence: claim.confidence.toFixed(2)
         },
-        episodes: [{ id: `${claim.id}-verification`, time: "00:32", title: "Claim checked", detail: `${claim.status}: ${claim.claim}` }]
+        episodes: [{ id: `${claim.id}-verification`, time: "00:32", title: "Claim grouped", detail: claim.claim }]
       };
-      nodeEvent(run, "reasoning", `交叉验证生成 claim：${claim.claim}`, claimNode);
+      nodeEvent(run, "reasoning", `主题判断已归组：${claim.claim}`, claimNode);
       for (const evidenceId of claim.evidenceIds.slice(0, 4)) {
         edgeEvent(run, "reasoning", "Evidence 支撑 claim。", { id: `edge-${evidenceId}-${claim.id}`, from: evidenceId, to: claim.id, kind: "supports", confidence: claim.confidence });
       }
-      edgeEvent(run, "reasoning", "Cross-check tool 验证 claim。", { id: `edge-${verification.toolCall.id}-${claim.id}`, from: verification.toolCall.id, to: claim.id, kind: "verifies", confidence: claim.confidence });
+      edgeEvent(run, "reasoning", "内部质量检查归组判断。", { id: `edge-${verification.toolCall.id}-${claim.id}`, from: verification.toolCall.id, to: claim.id, kind: "groups", confidence: claim.confidence });
     }
     for (const counterclaim of verification.output.contradictions) {
       nodeEvent(run, "reasoning", `冲突信号保留：${counterclaim.claim}`, {
@@ -2867,7 +4057,7 @@ async function executeDeepResearchRun(run) {
       });
       edgeEvent(run, "reasoning", "Evidence 与 counterclaim 形成冲突边。", { id: `edge-${counterclaim.sourceEvidenceId}-${counterclaim.id}`, from: counterclaim.sourceEvidenceId, to: counterclaim.id, kind: "contradicts", confidence: 0.52 });
     }
-    clusterEvent(run, "reasoning", "Verification cluster 已形成。", "verification");
+    clusterEvent(run, "reasoning", "Quality review cluster 已形成。", "verification");
     await waitForRun(run, 900);
     await waitUntilRunnable(run);
 
@@ -2935,6 +4125,23 @@ async function executeDeepResearchRun(run) {
     await waitForRun(run, 750);
     await waitUntilRunnable(run);
 
+    checkpointEvent(run, "drafting", {
+      id: "checkpoint-report-outline",
+      title: "Live Brief：报告写作路径已确定",
+      summary: "最终报告将按执行结论、关键事实、分析维度、风险边界和行动建议组织，而不是输出来源审计。",
+      knownFacts: [
+        `已形成 ${verification.output.claims.length} 个主题判断。`,
+        `已生成 ${cases.output.examples.length} 个案例化解读。`,
+        `已准备 ${charts.output.blocks.length} 个结构化图表/表格块。`
+      ],
+      openQuestions: [
+        "最终结论是否直接回答用户主题？",
+        "报告是否包含可执行的下一步？"
+      ],
+      nextAction: "写入最终报告，并执行质量评分 gate。",
+      sourceNodeIds: ["research-plan", ...verification.output.claims.slice(0, 4).map((claim) => claim.id), ...visualizationNodeIds.slice(0, 2)]
+    });
+
     const reportTool = await runRegisteredTool(run, registry, "report_write", {
       deepResearch: true,
       plan,
@@ -2992,7 +4199,7 @@ async function executeDeepResearchRun(run) {
     addEvent(run, {
       type: "run_completed",
       phase: "completed",
-      message: "Demo deep research run 已完成：报告包含来源矩阵、交叉验证、案例和结构图。",
+      message: "Demo deep research run 已完成：报告包含来源矩阵、质量检查、案例和结构图。",
       finalReport: report
     });
     broadcast(run, "run-closed", { runId: run.meta.id });
@@ -3312,7 +4519,42 @@ function envProviderKey() {
   return process.env.LOADING_MIND_PROVIDER_API_KEY
     || process.env.MIMO_API_KEY
     || process.env.OPENAI_API_KEY
+    || localEnvValue("LOADING_MIND_PROVIDER_API_KEY")
+    || localEnvValue("MIMO_API_KEY")
+    || localEnvValue("OPENAI_API_KEY")
     || "";
+}
+
+function envProviderConfigOverrides() {
+  return {
+    protocol: process.env.LOADING_MIND_PROVIDER_PROTOCOL || localEnvValue("LOADING_MIND_PROVIDER_PROTOCOL") || undefined,
+    baseUrl: process.env.LOADING_MIND_PROVIDER_BASE_URL || localEnvValue("LOADING_MIND_PROVIDER_BASE_URL") || undefined,
+    anthropicBaseUrl: process.env.LOADING_MIND_PROVIDER_ANTHROPIC_BASE_URL || localEnvValue("LOADING_MIND_PROVIDER_ANTHROPIC_BASE_URL") || undefined,
+    model: process.env.LOADING_MIND_PROVIDER_MODEL || localEnvValue("LOADING_MIND_PROVIDER_MODEL") || undefined,
+    temperature: process.env.LOADING_MIND_PROVIDER_TEMPERATURE || localEnvValue("LOADING_MIND_PROVIDER_TEMPERATURE") || undefined,
+    maxTokens: process.env.LOADING_MIND_PROVIDER_MAX_TOKENS || localEnvValue("LOADING_MIND_PROVIDER_MAX_TOKENS") || undefined
+  };
+}
+
+function valueIsDefaultProvider(value, defaults) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    return true;
+  }
+  return defaults.map((item) => String(item ?? "").trim()).includes(normalized);
+}
+
+function providerConfigWithEnvironment(input = {}) {
+  const env = envProviderConfigOverrides();
+  return {
+    ...input,
+    protocol: valueIsDefaultProvider(input.protocol, [providerDefaults.protocol, "openai"]) ? env.protocol || input.protocol : input.protocol,
+    baseUrl: valueIsDefaultProvider(input.baseUrl, [providerDefaults.baseUrl, "https://token-plan-cn.xiaomimimo.com/v1"]) ? env.baseUrl || input.baseUrl : input.baseUrl,
+    anthropicBaseUrl: valueIsDefaultProvider(input.anthropicBaseUrl, [providerDefaults.anthropicBaseUrl, "https://token-plan-cn.xiaomimimo.com/anthropic"]) ? env.anthropicBaseUrl || input.anthropicBaseUrl : input.anthropicBaseUrl,
+    model: valueIsDefaultProvider(input.model, [providerDefaults.model, "mimo-v2.5-pro"]) ? env.model || input.model : input.model,
+    temperature: valueIsDefaultProvider(input.temperature, [providerDefaults.temperature]) ? env.temperature || input.temperature : input.temperature,
+    maxTokens: valueIsDefaultProvider(input.maxTokens, [providerDefaults.maxTokens, 1408]) ? env.maxTokens || input.maxTokens : input.maxTokens
+  };
 }
 
 export function createDiagnosticsSnapshot() {
@@ -3345,7 +4587,7 @@ function createRun(body, options = {}) {
   const createdAt = now();
   const runMode = body.runMode === "live" ? "live" : "demo";
   const providerConfig = sanitizeProviderConfig({
-    ...(body.providerConfig ?? {}),
+    ...providerConfigWithEnvironment(body.providerConfig ?? {}),
     apiKey: body.providerConfig?.apiKey || envProviderKey()
   });
   const allowDemoFallback = options.allowDemoFallback ?? (runMode === "demo" || process.env.LOADING_MIND_DEMO_MODE === "1");

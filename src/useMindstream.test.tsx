@@ -51,6 +51,7 @@ describe("useMindstream run modes", () => {
     expect(result.current.state.status).toBe("failed");
     expect(result.current.state.run?.id ?? "").not.toMatch(/^recorded-/);
     expect(result.current.state.events).toHaveLength(0);
+    expect(result.current.state.graphNodes.map((node) => node.id)).toEqual(["task-intent", "ontology-runtime", "research-plan"]);
     expect(result.current.state.error).toBe("offline");
   });
 });

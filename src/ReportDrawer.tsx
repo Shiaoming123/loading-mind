@@ -1,9 +1,10 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { ChevronLeft, ChevronRight, Download, FileText, RotateCcw } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Download, FileText, Printer, RotateCcw } from "lucide-react";
 import mermaid from "mermaid";
 import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import type { ReportExportFormat } from "./reportExport";
 import type { Artifact, ArtifactBlock } from "./types";
 
 type SourceLabelMap = Record<string, string>;
@@ -66,7 +67,14 @@ function blockPreview(block: ArtifactBlock) {
 function MarkdownBody({ body }: { body: string }) {
   return (
     <div className="markdown-body">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+      <ReactMarkdown
+        components={{
+          img: () => null
+        }}
+        remarkPlugins={[remarkGfm]}
+      >
+        {body}
+      </ReactMarkdown>
     </div>
   );
 }
@@ -113,15 +121,80 @@ function MermaidBlock({ code }: { code: string }) {
   );
 }
 
+function ReportQualityPanel({ artifact }: { artifact: Artifact }) {
+  const quality = artifact.quality;
+  if (!quality) {
+    return null;
+  }
+  return (
+    <section className={`report-quality ${quality.passed ? "passed" : "needs-work"}`} aria-label="Report Quality">
+      <header>
+        {quality.passed ? <CheckCircle2 size={15} /> : <AlertTriangle size={15} />}
+        <span>Report Quality</span>
+        <strong>{quality.score}</strong>
+      </header>
+      <div className="quality-dimensions">
+        {quality.dimensions.map((dimension) => (
+          <span className={dimension.passed ? "passed" : "failed"} key={dimension.id}>
+            {dimension.label}
+          </span>
+        ))}
+      </div>
+      {!quality.passed && quality.repairSuggestions.length > 0 && (
+        <p>{quality.repairSuggestions.slice(0, 2).join(" ")}</p>
+      )}
+    </section>
+  );
+}
+
+function ReportHero({ artifact }: { artifact: Artifact }) {
+  return (
+    <section className="report-hero" aria-label="Report summary">
+      <span className="report-kind">{artifact.kind === "failure" ? "Failure report" : "Final report"}</span>
+      <h2>{artifact.title}</h2>
+      <MarkdownBody body={artifact.body} />
+    </section>
+  );
+}
+
+function ReportToc({
+  artifact,
+  onFocusSource
+}: {
+  artifact: Artifact;
+  onFocusSource: (nodeId: string | null) => void;
+}) {
+  const sections = artifact.sections ?? [];
+  if (sections.length === 0) {
+    return null;
+  }
+  return (
+    <nav className="report-toc" aria-label="Report table of contents">
+      <span>Contents</span>
+      {sections.map((section, index) => (
+        <button
+          key={`toc-${section.id}`}
+          type="button"
+          aria-label={section.title.replace(/^[一二三四五六七八九十]+、\s*/, "")}
+          onClick={() => onFocusSource(section.sourceNodeIds[0] ?? null)}
+        >
+          <small>{String(index + 1).padStart(2, "0")}</small>
+          <strong>{section.title.replace(/^[一二三四五六七八九十]+、\s*/, "")}</strong>
+        </button>
+      ))}
+    </nav>
+  );
+}
+
 function claimStatusLabel(status?: string) {
-  if (status === "verified") {
-    return "Verified";
+  if (status === "source-linked" || status === "verified") {
+    return "Source-linked";
   }
   if (status === "conflicted") {
     return "Conflicted";
   }
-  if (status === "weak") {
-    return "Weak";
+  if (status === "needs-context" || status === "weak") {
+    return "Needs context";
   }
   return "Review";
 }
@@ -137,13 +210,17 @@ function readableClaimGraphClaims(block: Extract<ArtifactBlock, { type: "claim_g
       return {
         id: node.id,
         label: node.label,
-        status: "unknown",
-        supportCount: evidenceIds.length,
+        reviewState: "unknown",
+        sourceCount: evidenceIds.length,
         confidence: 0,
         evidenceIds,
         sourceTitles: evidenceIds.slice(0, 3).map((id) => sourceLabelMap[id] ?? id)
       };
     });
+}
+
+function claimReviewState(claim: { reviewState?: string; status?: string }) {
+  return claim.reviewState ?? claim.status ?? "review";
 }
 
 function ClaimGraphBlock({
@@ -180,6 +257,7 @@ function ClaimGraphBlock({
             .filter(Boolean)
             .slice(0, 3);
           const focusId = evidenceIds[0] ?? claim.id;
+          const reviewState = claimReviewState(claim);
           return (
             <button
               className="claim-graph-card"
@@ -187,10 +265,10 @@ function ClaimGraphBlock({
               onClick={() => onFocusSource(focusId)}
               type="button"
             >
-              <span className={`claim-status status-${claim.status ?? "unknown"}`}>{claimStatusLabel(claim.status)}</span>
+              <span className={`claim-status status-${reviewState}`}>{claimStatusLabel(reviewState)}</span>
               <strong>{claim.label}</strong>
               <small>
-                {(claim.supportCount ?? evidenceIds.length) || evidenceIds.length} supporting sources
+                {(claim.sourceCount ?? evidenceIds.length) || evidenceIds.length} linked excerpts
                 {claim.confidence ? ` / confidence ${Number(claim.confidence).toFixed(2)}` : ""}
               </small>
               {sourceTitles.length > 0 && (
@@ -272,31 +350,9 @@ function ReportPreview({
 
   return (
     <article className="report-preview" aria-label="Collapsed report preview">
-      {blocks.length > 0 && (
-        <div className="report-preview-group">
-          <span>Structured blocks</span>
-          {blocks.slice(0, 6).map((block) => {
-            const sourceNodeId = firstSource(block.sourceNodeIds);
-            return (
-              <button
-                className="report-preview-item"
-                disabled={!sourceNodeId}
-                key={`preview-block-${block.id}`}
-                onClick={() => onFocusSource(sourceNodeId)}
-                type="button"
-              >
-                <small>{blockTypeLabel(block)}</small>
-                <strong>{block.title ?? "Report block"}</strong>
-                <span>{blockPreview(block)}</span>
-                {block.sourceNodeIds && block.sourceNodeIds.length > 0 && <em>{sourceLabel(block.sourceNodeIds, sourceLabelMap)}</em>}
-              </button>
-            );
-          })}
-        </div>
-      )}
       {sections.length > 0 && (
         <div className="report-preview-group">
-          <span>Sections</span>
+          <span>Report sections</span>
           {sections.slice(0, 5).map((section) => {
             const sourceNodeId = firstSource(section.sourceNodeIds);
             return (
@@ -311,6 +367,28 @@ function ReportPreview({
                 <strong>{section.title}</strong>
                 <span>{textPreview(section.body)}</span>
                 {section.sourceNodeIds.length > 0 && <em>{sourceLabel(section.sourceNodeIds, sourceLabelMap)}</em>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {blocks.length > 0 && (
+        <div className="report-preview-group">
+          <span>Traceability appendices</span>
+          {blocks.slice(0, 6).map((block) => {
+            const sourceNodeId = firstSource(block.sourceNodeIds);
+            return (
+              <button
+                className="report-preview-item"
+                disabled={!sourceNodeId}
+                key={`preview-block-${block.id}`}
+                onClick={() => onFocusSource(sourceNodeId)}
+                type="button"
+              >
+                <small>{blockTypeLabel(block)}</small>
+                <strong>{block.title ?? "Report block"}</strong>
+                <span>{blockPreview(block)}</span>
+                {block.sourceNodeIds && block.sourceNodeIds.length > 0 && <em>{sourceLabel(block.sourceNodeIds, sourceLabelMap)}</em>}
               </button>
             );
           })}
@@ -333,7 +411,7 @@ export function ReportDrawer({
   sourceLabelMap?: SourceLabelMap;
   onFocusSource: (nodeId: string | null) => void;
   onReplay: () => void;
-  onExport: (format: "markdown" | "json") => void;
+  onExport: (format: ReportExportFormat) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -364,52 +442,66 @@ export function ReportDrawer({
               <button type="button" onClick={() => onExport("markdown")} aria-label="Export markdown" title="Export markdown">
                 <Download size={15} />
               </button>
-              <button type="button" onClick={() => onExport("json")} aria-label="Export json" title="Export json">
+              <button type="button" onClick={() => onExport("word")} aria-label="Export Word" title="Export Word">
                 <FileText size={15} />
+              </button>
+              <button type="button" onClick={() => onExport("pdf")} aria-label="Export PDF" title="Export PDF">
+                <Printer size={15} />
               </button>
             </div>
           </header>
-          <h2>{artifact.title}</h2>
-          <MarkdownBody body={artifact.body} />
-          {!expanded && <ReportPreview artifact={artifact} sourceLabelMap={sourceLabelMap} onFocusSource={onFocusSource} />}
-          {artifact.sections && (
-            <nav className="report-toc" aria-label="Report table of contents">
-              {artifact.sections.map((section) => (
-                <button
-                  key={`toc-${section.id}`}
-                  type="button"
-                  onClick={() => onFocusSource(section.sourceNodeIds[0] ?? null)}
-                >
-                  {section.title}
-                </button>
-              ))}
-            </nav>
+          {!expanded && (
+            <>
+              <ReportHero artifact={artifact} />
+              <ReportQualityPanel artifact={artifact} />
+              <ReportToc artifact={artifact} onFocusSource={onFocusSource} />
+              <ReportPreview artifact={artifact} sourceLabelMap={sourceLabelMap} onFocusSource={onFocusSource} />
+            </>
           )}
-          {expanded && artifact.blocks && (
-            <article className="report-blocks" aria-label="Structured report blocks">
-              {artifact.blocks.map((block) => (
-                <ReportBlock block={block} expanded={expanded} key={block.id} sourceLabelMap={sourceLabelMap} onFocusSource={onFocusSource} />
-              ))}
-            </article>
-          )}
-          {expanded && artifact.sections && (
-            <article className="report-article" aria-label="Generated report article">
-              {artifact.sections.map((section) => {
-                const nodeId = section.sourceNodeIds[0] ?? null;
-                return (
-                  <button
-                    className={focusNodeId === nodeId ? "active" : ""}
-                    key={section.id}
-                    type="button"
-                    onClick={() => onFocusSource(nodeId)}
-                  >
-                    <strong>{section.title}</strong>
-                    <span>{section.body}</span>
-                    <em>{sourceLabel(section.sourceNodeIds, sourceLabelMap)}</em>
-                  </button>
-                );
-              })}
-            </article>
+          {expanded && (
+            <div className="report-reader-grid">
+              <aside className="report-reader-rail" aria-label="Report controls and quality">
+                <ReportQualityPanel artifact={artifact} />
+                <ReportToc artifact={artifact} onFocusSource={onFocusSource} />
+              </aside>
+              <main className="report-reader-main">
+                <ReportHero artifact={artifact} />
+                {artifact.sections && (
+                  <article className="report-article" aria-label="Generated report article">
+                    {artifact.sections.map((section, index) => {
+                      const nodeId = section.sourceNodeIds[0] ?? null;
+                      return (
+                        <section className={`report-section-card ${focusNodeId === nodeId ? "active" : ""}`} key={section.id}>
+                          <header>
+                            <span>{String(index + 1).padStart(2, "0")}</span>
+                            <h3>{section.title.replace(/^[一二三四五六七八九十]+、\s*/, "")}</h3>
+                          </header>
+                          <MarkdownBody body={section.body} />
+                          {section.sourceNodeIds.length > 0 && (
+                            <button className="report-source-line" type="button" onClick={() => onFocusSource(nodeId)}>
+                              {sourceLabel(section.sourceNodeIds, sourceLabelMap)}
+                            </button>
+                          )}
+                        </section>
+                      );
+                    })}
+                  </article>
+                )}
+                {artifact.blocks && artifact.blocks.length > 0 && (
+                  <details className="report-appendices">
+                    <summary>
+                      <span>Traceability appendices</span>
+                      <strong>{artifact.blocks.length}</strong>
+                    </summary>
+                    <article className="report-blocks" aria-label="Traceability appendices">
+                      {artifact.blocks.map((block) => (
+                        <ReportBlock block={block} expanded={expanded} key={block.id} sourceLabelMap={sourceLabelMap} onFocusSource={onFocusSource} />
+                      ))}
+                    </article>
+                  </details>
+                )}
+              </main>
+            </div>
           )}
         </motion.section>
       )}

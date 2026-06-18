@@ -1,6 +1,6 @@
-const defaultOpenAIBaseUrl = "https://token-plan-cn.xiaomimimo.com/v1";
-const defaultAnthropicBaseUrl = "https://token-plan-cn.xiaomimimo.com/anthropic";
-const defaultModel = "mimo-v2.5-pro";
+const defaultOpenAIBaseUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const defaultAnthropicBaseUrl = "";
+const defaultModel = "deepseek-v4-flash";
 
 export const providerDefaults = {
   protocol: "openai",
@@ -8,7 +8,7 @@ export const providerDefaults = {
   anthropicBaseUrl: defaultAnthropicBaseUrl,
   model: defaultModel,
   temperature: 0.35,
-  maxTokens: 1408
+  maxTokens: 2200
 };
 
 export function maskApiKey(apiKey = "") {
@@ -69,6 +69,20 @@ function anthropicMessagesEndpoint(baseUrl) {
   return `${cleanBase}/v1/messages`;
 }
 
+function isMimoTokenPlan(clean) {
+  return /xiaomimimo\.com/i.test(`${clean.baseUrl} ${clean.anthropicBaseUrl}`) || /^tp-/i.test(clean.apiKey);
+}
+
+function providerAuthHeaders(clean, protocol = clean.protocol) {
+  if (isMimoTokenPlan(clean)) {
+    return { "api-key": clean.apiKey };
+  }
+  if (protocol === "anthropic") {
+    return { "x-api-key": clean.apiKey };
+  }
+  return { "Authorization": `Bearer ${clean.apiKey}` };
+}
+
 export function buildProviderRequest(config, messages) {
   const clean = sanitizeProviderConfig(config);
   if (!clean.apiKey) {
@@ -93,23 +107,28 @@ export function buildProviderRequest(config, messages) {
       },
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": clean.apiKey,
+        ...providerAuthHeaders(clean, "anthropic"),
         "anthropic-version": "2023-06-01"
       }
     };
   }
 
+  const body = {
+    model: clean.model,
+    messages,
+    temperature: clean.temperature
+  };
+  if (isMimoTokenPlan(clean)) {
+    body.max_completion_tokens = clean.maxTokens;
+  } else {
+    body.max_tokens = clean.maxTokens;
+  }
   return {
     url: joinEndpoint(clean.baseUrl, "/chat/completions"),
-    body: {
-      model: clean.model,
-      messages,
-      temperature: clean.temperature,
-      max_tokens: clean.maxTokens
-    },
+    body,
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${clean.apiKey}`
+      ...providerAuthHeaders(clean, "openai")
     }
   };
 }
@@ -121,9 +140,7 @@ export function buildModelDiscoveryRequest(config) {
   }
   return {
     url: joinEndpoint(clean.baseUrl, "/models"),
-    headers: {
-      "Authorization": `Bearer ${clean.apiKey}`
-    }
+    headers: providerAuthHeaders(clean, "openai")
   };
 }
 

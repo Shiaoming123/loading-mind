@@ -79,8 +79,8 @@ function runFixture() {
             claims: [{
               id: "claim-1",
               label: "成本与额度约束会影响高频工程使用",
-              status: "verified",
-              supportCount: 1,
+              reviewState: "source-linked",
+              sourceCount: 1,
               evidenceIds: ["evidence-1"],
               sourceTitles: ["Source"]
             }]
@@ -107,6 +107,7 @@ describe("exportRun", () => {
     expect(markdown).not.toContain("evidence-1 -> claim-1");
     expect(markdown).toContain("tp-c21...vc6");
     expect(markdown).not.toContain("tp-c21wxh0dkb0bc24n2i9fs5ng5wc2xwhw0mrxesbmnqdw0vc6");
+    expect(markdown.indexOf("### Context")).toBeLessThan(markdown.indexOf("### Readable claim graph"));
   });
 
   it("exports structured JSON with report, tools, and evidence", () => {

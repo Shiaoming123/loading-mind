@@ -30,6 +30,7 @@ export function agentEventToLoadingEvent(event: AgentEvent): LoadingEvent {
     timestamp: event.elapsedMs,
     message: event.message,
     graphEvent: event.graphEvent,
+    checkpoint: event.checkpoint,
     finalReport: event.finalReport
   };
 }
@@ -50,12 +51,12 @@ export function defaultRunRequest(): CreateRunRequest {
     visualization: "auto",
     providerConfig: {
       protocol: "openai",
-      baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
-      anthropicBaseUrl: "https://token-plan-cn.xiaomimimo.com/anthropic",
+      baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      anthropicBaseUrl: "",
       apiKey: "",
-      model: "mimo-v2.5-pro",
+      model: "deepseek-v4-flash",
       temperature: 0.35,
-      maxTokens: 1408
+      maxTokens: 2200
     }
   };
 }

@@ -115,6 +115,11 @@ export function runToMarkdown(run) {
     lines.push("No final report was recorded.");
   } else {
     lines.push(report.body, "");
+    for (const section of report.sections ?? []) {
+      lines.push(`### ${section.title}`, "");
+      lines.push(section.body, "");
+      lines.push(`Source nodes: ${section.sourceNodeIds.join(", ") || "none"}`, "");
+    }
     for (const block of report.blocks ?? []) {
       lines.push(`### ${block.title || block.id}`, "");
       if (block.type === "markdown") {
@@ -131,7 +136,7 @@ export function runToMarkdown(run) {
       } else if (block.type === "claim_graph") {
         lines.push(`Claim graph: ${block.claims?.length ?? block.nodes.length} claims, ${block.edges.length} evidence links.`, "");
         for (const claim of block.claims ?? []) {
-          lines.push(`- ${claim.label} (${claim.status || "review"}, ${claim.supportCount ?? claim.evidenceIds?.length ?? 0} supporting sources)`);
+          lines.push(`- ${claim.label} (${claim.sourceCount ?? claim.evidenceIds?.length ?? 0} linked excerpts)`);
           const sourceTitles = claim.sourceTitles ?? [];
           if (sourceTitles.length > 0) {
             lines.push(`  - Sources: ${sourceTitles.join(" / ")}`);
@@ -139,11 +144,6 @@ export function runToMarkdown(run) {
         }
         lines.push("");
       }
-    }
-    for (const section of report.sections ?? []) {
-      lines.push(`### ${section.title}`, "");
-      lines.push(section.body, "");
-      lines.push(`Source nodes: ${section.sourceNodeIds.join(", ") || "none"}`, "");
     }
   }
 

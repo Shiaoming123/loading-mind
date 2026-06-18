@@ -147,6 +147,7 @@ export function useMindstream() {
     async (request: CreateRunRequest = defaultRunRequest()) => {
       closeEventSource();
       clearFallback();
+      dispatch({ type: "BEGIN_SUBMIT", request });
 
       try {
         const response = await fetch("/api/runs", {

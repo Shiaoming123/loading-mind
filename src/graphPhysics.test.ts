@@ -4,11 +4,15 @@ import {
   buildGraphSceneSnapshot,
   connectedIds,
   clusterAnchor,
+  collisionRadius,
   computeSceneInsets,
   deriveNodeTier,
+  graphLinkDistance,
+  graphLinkStrength,
   initialNodePosition,
   isEdgeFocused,
   labelVisible,
+  nodeLayoutAnchor,
   normalizeEdge,
   nodeRenderToken,
   nodeRadius
@@ -97,6 +101,66 @@ describe("graphPhysics", () => {
     expect(mobileAnchor.x).toBeGreaterThan(mobileInsets.left);
     expect(mobileAnchor.x).toBeLessThan(mobile.width - mobileInsets.right);
     expect(mobileAnchor.y).toBeGreaterThan(mobileInsets.top);
+  });
+
+  it("places execution-step anchors in a stable left-to-right lane", () => {
+    const viewport = { width: 1200, height: 760, insets: computeSceneInsets({ width: 1200, height: 760 }) };
+    const planAnchor = nodeLayoutAnchor({
+      id: "research-plan",
+      kind: "research_plan",
+      label: "Plan",
+      executionStep: { stepId: "plan", stepIndex: 1, stepLabel: "Plan", stepStatus: "queued" }
+    }, viewport);
+    const writeAnchor = nodeLayoutAnchor({
+      id: "report-write",
+      kind: "tool_call",
+      label: "Write",
+      executionStep: { stepId: "write", stepIndex: 8, stepLabel: "Write", stepStatus: "queued" }
+    }, viewport);
+
+    expect(writeAnchor.x).toBeGreaterThan(planAnchor.x);
+    expect(Math.abs(writeAnchor.y - planAnchor.y)).toBeLessThan(viewport.height * 0.18);
+  });
+
+  it("uses stronger defaults for execution flow than background semantic edges", () => {
+    const flow = normalizeEdge({ id: "flow", from: "a", to: "b", kind: "execution_flow" });
+    const semantic = normalizeEdge({ id: "semantic", from: "a", to: "c", kind: "extracts" });
+
+    expect(graphLinkStrength(flow)).toBeGreaterThan(graphLinkStrength(semantic));
+    expect(graphLinkDistance(flow)).toBeLessThan(graphLinkDistance(semantic));
+  });
+
+  it("adds more collision padding for important labeled nodes", () => {
+    const output = {
+      ...forceNode({
+        id: "section",
+        kind: "section",
+        label: "Section",
+        radius: 20,
+        mass: 1,
+        bornAt: 0,
+        pinned: false,
+        x: 0,
+        y: 0
+      }),
+      importance: 0.9
+    };
+    const record = {
+      ...forceNode({
+        id: "source",
+        kind: "source",
+        label: "Source",
+        radius: 20,
+        mass: 1,
+        bornAt: 0,
+        pinned: false,
+        x: 0,
+        y: 0
+      }),
+      importance: 0.4
+    };
+
+    expect(collisionRadius(output)).toBeGreaterThan(collisionRadius(record));
   });
 
   it("builds a scene snapshot from runtime graph positions", () => {

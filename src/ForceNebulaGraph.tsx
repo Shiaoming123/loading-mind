@@ -17,14 +17,17 @@ import {
   aggregateVisibleEdges,
   buildGraphSceneSnapshot,
   clampToViewport,
-  clusterAnchor,
   clusterSeeds,
+  collisionRadius,
   connectedIds,
   deriveNodeImportance,
   deriveNodeTier,
+  graphLinkDistance,
+  graphLinkStrength,
   initialNodePosition,
   isEdgeFocused,
   labelVisible,
+  nodeLayoutAnchor,
   nodeRenderToken,
   nodeRadius,
   normalizeEdge
@@ -61,6 +64,11 @@ type NodeSnapshot = {
 type RetryState = {
   status: "pending" | "succeeded" | "failed";
   message: string;
+};
+
+type NodeMeaningSection = {
+  title: string;
+  body: string;
 };
 
 const nodeKindLabel: Record<GraphNodeKind, string> = {
@@ -200,6 +208,103 @@ export function visibleNodeAttributes(attributes: Record<string, string>) {
     }));
 }
 
+const nodeKindMeaning: Record<GraphNodeKind, string> = {
+  task_intent: "这是本次运行的目标节点，用来固定用户问题、范围和后续所有执行步骤的来源。",
+  ontology: "这是过程本体节点，用来说明 runtime 会把哪些对象和关系映射成可检查图谱。",
+  research_plan: "这是研究计划节点，用来承载问题拆解、检索分支、验证维度和报告大纲。",
+  search_query: "这是检索分支节点，用来把研究计划转成具体搜索问题。",
+  source: "这是来源节点，用来记录搜索返回或官方种子来源，后续会被读取和排序。",
+  entity: "这是实体节点，用来保存从任务或材料中抽取出的关键概念。",
+  evidence: "这是证据节点，用来保存可引用的来源片段、主张和置信度。",
+  tool_call: "这是工具调用节点，用来记录一次真实或降级的工具输入、状态和输出摘要。",
+  observation: "这是观察节点，用来汇总工具执行后的可用结果、失败降级或阶段产物。",
+  claim: "这是结论节点，用来表达由证据和观察综合得到的判断。",
+  counterclaim: "这是冲突结论节点，用来保留与主判断相反或需要谨慎处理的信号。",
+  verification: "这是验证节点，用来表示交叉检查、质量检查或可信度判断。",
+  example: "这是案例节点，用来说明某个结论如何落到具体样本或场景。",
+  visualization: "这是可视化节点，用来记录报告中的图表或结构化展示方案。",
+  section: "这是报告章节节点，用来把最终报告内容映射回过程图谱。"
+};
+
+const executionActionLabel: Record<NonNullable<GraphNode["executionStep"]>["stepId"], string> = {
+  plan: "拆解问题和研究路径",
+  search: "生成并执行检索分支",
+  fetch: "读取候选来源正文",
+  rank: "筛选和排序来源质量",
+  extract: "抽取证据片段",
+  verify: "交叉检查和验证判断",
+  visualize: "规划报告中的结构化展示",
+  write: "写入最终报告章节"
+};
+
+function compactText(value: string | undefined, maxLength = 240) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength).trim()}...` : normalized;
+}
+
+export function nodeMeaningSections(
+  node: GraphNode,
+  edges: GraphEdge[] = [],
+  allNodes: GraphNode[] = [],
+  reportSections: ReportSection[] = []
+): NodeMeaningSection[] {
+  const sections: NodeMeaningSection[] = [];
+  const primaryMeaning = compactText(node.summary || node.shortBody || node.evidence?.claim || node.evidence?.quote || node.toolCall?.outputSummary);
+  sections.push({
+    title: "任务含义",
+    body: primaryMeaning || nodeKindMeaning[node.kind]
+  });
+
+  if (node.executionStep) {
+    sections.push({
+      title: "执行动作",
+      body: `${node.executionStep.stepLabel} · ${node.executionStep.stepStatus}：${executionActionLabel[node.executionStep.stepId]}。`
+    });
+  } else if (node.toolCall) {
+    sections.push({
+      title: "执行动作",
+      body: `调用 ${node.toolCall.toolName}，状态 ${node.toolCall.status}，输入摘要：${summarizeToolInput(node.toolCall.input)}。`
+    });
+  } else if (node.episodes?.[0]) {
+    sections.push({
+      title: "执行动作",
+      body: compactText(`${node.episodes[0].title}：${node.episodes[0].detail}`)
+    });
+  } else {
+    sections.push({
+      title: "执行动作",
+      body: nodeKindMeaning[node.kind]
+    });
+  }
+
+  const output = node.toolCall?.outputSummary
+    || node.evidence?.quote
+    || reportSections.map((section) => section.title).join(" / ")
+    || node.sourceRefs?.slice(0, 2).join(" / ")
+    || (node.confidence ? `当前置信度 ${Number(node.confidence).toFixed(2)}。` : "");
+  if (output) {
+    sections.push({
+      title: "产出",
+      body: compactText(output)
+    });
+  }
+
+  if (edges.length > 0) {
+    const relationText = edges.slice(0, 4).map((edge) => {
+      const neighborId = edge.from === node.id ? edge.to : edge.from;
+      const neighbor = allNodes.find((item) => item.id === neighborId);
+      const direction = edge.from === node.id ? "指向" : "来自";
+      return `${edge.label ?? edgeKindLabel[edge.kind]} ${direction} ${neighbor?.label ?? neighborId}`;
+    }).join("；");
+    sections.push({
+      title: "关系",
+      body: `${relationText}${edges.length > 4 ? `；另有 ${edges.length - 4} 条关系` : ""}。`
+    });
+  }
+
+  return sections;
+}
+
 export function ForceNebulaGraph({
   nodes,
   edges,
@@ -263,23 +368,23 @@ export function ForceNebulaGraph({
   useEffect(() => {
     const simulation = simulationRef.current;
     const linkForce = linkForceRef.current
-      .distance((edge) => edge.distance ?? 86)
-      .strength((edge) => edge.strength ?? 0.62);
+      .distance((edge) => graphLinkDistance(edge))
+      .strength((edge) => graphLinkStrength(edge));
 
     simulation
       .force("link", linkForce)
-      .force("charge", forceManyBody<ForceGraphNode>().strength((node) => -165 * node.mass))
-      .force("collide", forceCollide<ForceGraphNode>().radius((node) => node.radius + 14).iterations(3))
+      .force("charge", forceManyBody<ForceGraphNode>().strength((node) => -190 * node.mass * (0.78 + node.importance * 0.38)))
+      .force("collide", forceCollide<ForceGraphNode>().radius((node) => collisionRadius(node)).iterations(4))
       .force(
-        "clusterX",
-        forceX<ForceGraphNode>((node) => clusterAnchor(node.cluster, viewportRef.current).x).strength(0.105)
+        "anchorX",
+        forceX<ForceGraphNode>((node) => nodeLayoutAnchor(node, viewportRef.current).x).strength((node) => node.executionStep ? 0.18 : 0.11)
       )
       .force(
-        "clusterY",
-        forceY<ForceGraphNode>((node) => clusterAnchor(node.cluster, viewportRef.current).y).strength(0.11)
+        "anchorY",
+        forceY<ForceGraphNode>((node) => nodeLayoutAnchor(node, viewportRef.current).y).strength((node) => node.executionStep ? 0.16 : 0.115)
       )
-      .velocityDecay(0.42)
-      .alphaDecay(0.036)
+      .velocityDecay(0.48)
+      .alphaDecay(0.034)
       .stop();
   }, []);
 
@@ -564,7 +669,8 @@ export function ForceNebulaGraph({
         const focused = isEdgeFocused(edge, activeFocusId);
         const faded = activeFocusId && !focused;
         const curve = edgeCurve(from, to);
-        const alpha = faded ? 0.028 : focused ? 0.31 : 0.08;
+        const priorityEdge = edge.kind === "execution_flow" || edge.kind === "becomes_section" || edge.kind === "feeds_visual";
+        const alpha = faded ? 0.018 : focused ? 0.34 : priorityEdge ? 0.105 : 0.045;
 
         context.beginPath();
         context.moveTo(from.x ?? 0, from.y ?? 0);
@@ -573,7 +679,7 @@ export function ForceNebulaGraph({
           edge.kind === "uses_tool" || edge.kind === "synthesizes"
             ? `rgba(217, 130, 43, ${alpha})`
             : `rgba(62, 133, 129, ${alpha})`;
-        context.lineWidth = focused ? 1 : 0.52;
+        context.lineWidth = focused ? 1.15 : priorityEdge ? 0.62 : 0.42;
         context.stroke();
 
         if (focused) {
@@ -687,6 +793,10 @@ export function ForceNebulaGraph({
   const selectedRetryState = selectedNodeId ? retryStates[selectedNodeId] : null;
   const selectedToolInput = selectedNode?.toolCall?.input ?? null;
   const selectedVisibleAttributes = selectedNode?.attributes ? visibleNodeAttributes(selectedNode.attributes) : [];
+  const selectedMeaningSections = useMemo(
+    () => selectedNode ? nodeMeaningSections(selectedNode, selectedNodeEdges, nodes, selectedReportSections) : [],
+    [nodes, selectedNode, selectedNodeEdges, selectedReportSections]
+  );
 
   const handleRetryTool = async (toolNodeId: string) => {
     setRetryStates((current) => ({
@@ -732,6 +842,14 @@ export function ForceNebulaGraph({
             <span>{nodeKindLabel[selectedNode.kind]}</span>
             <h2>{selectedNode.label}</h2>
             <p>{selectedNode.summary ?? selectedNode.shortBody}</p>
+            <div className="inspector-meaning">
+              {selectedMeaningSections.map((section) => (
+                <section key={section.title}>
+                  <strong>{section.title}</strong>
+                  <span>{section.body}</span>
+                </section>
+              ))}
+            </div>
             <dl>
               <div>
                 <dt>Tier</dt>
@@ -799,7 +917,7 @@ export function ForceNebulaGraph({
                     onClick={() => void handleRetryTool(selectedNode.id)}
                     disabled={selectedRetryState?.status === "pending"}
                   >
-                    {selectedRetryState?.status === "pending" ? "Retrying..." : "Retry tool"}
+                    {selectedRetryState?.status === "pending" ? "Retrying..." : "Retry failed tool"}
                   </button>
                 )}
                 {selectedRetryState && <span className={`retry-feedback ${selectedRetryState.status}`}>{selectedRetryState.message}</span>}
@@ -807,10 +925,10 @@ export function ForceNebulaGraph({
             )}
             {selectedNode.evidence && selectedNode.status !== "excluded" && (
               <div className="inspector-report-link">
-                <strong>Evidence Control</strong>
+                <strong>Intervention</strong>
                 <span>{selectedNode.evidence.quote}</span>
                 <button type="button" onClick={() => onExcludeEvidence(selectedNode.evidence!.id)}>
-                  Exclude from report
+                  Exclude excerpt
                 </button>
               </div>
             )}

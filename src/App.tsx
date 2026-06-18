@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, FlaskConical, Home, Pause, Play, RotateCcw, Send, Square } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, Home, Loader2, Pause, Play, RotateCcw, Send, Square } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { defaultRunRequest } from "./agentProtocol";
 import { getPhaseIndex, phases } from "./demoData";
@@ -7,8 +7,9 @@ import { ForceNebulaGraph } from "./ForceNebulaGraph";
 import { computeSceneInsets } from "./graphPhysics";
 import { MindstreamCanvas } from "./MindstreamCanvas";
 import { ReportDrawer } from "./ReportDrawer";
+import { exportReport, type ReportExportFormat } from "./reportExport";
 import { useMindstream } from "./useMindstream";
-import type { GraphSceneSnapshot, LoadingPhase, ProviderConfig, ProviderProtocol, RunMode } from "./types";
+import type { GraphSceneSnapshot, LoadingPhase, ThinkingCheckpoint } from "./types";
 
 const phaseCopy: Record<LoadingPhase, string> = {
   initializing: "任务 seed 正在建立",
@@ -40,67 +41,80 @@ const emptyScene: GraphSceneSnapshot = {
   activePathIds: []
 };
 
-const calibrationTopics = [
-  "AI Agent 长链路任务中，如何判断用户需要过程可视化还是只需要最终答案？",
-  "企业知识库问答系统上线前，应该如何设计评估指标、失败回退和人工复核流程？",
-  "一个面向产品团队的数据分析 Agent，如何把工具调用、证据来源和结论置信度展示给非技术用户？"
-];
-
-function maskedProvider(provider: ProviderConfig) {
-  const key = provider.apiKey.trim();
-  return key ? `${key.slice(0, 6)}...${key.slice(-3)}` : "API key required";
-}
-
-const localRuntimeSettingsKey = "loading-mind.runtime-settings";
-
-type LocalRuntimeSettings = {
-  tavilyApiKey?: string;
-  braveApiKey?: string;
-  firecrawlApiKey?: string;
-  exaApiKey?: string;
-  providerConfig?: Partial<ProviderConfig>;
-};
-
-function readLocalRuntimeSettings(): LocalRuntimeSettings {
-  try {
-    const raw = window.localStorage.getItem(localRuntimeSettingsKey);
-    return raw ? JSON.parse(raw) as LocalRuntimeSettings : {};
-  } catch {
-    return {};
+function LiveBriefPanel({
+  checkpoints,
+  status,
+  sourceLabelMap,
+  onFocusSource
+}: {
+  checkpoints: ThinkingCheckpoint[];
+  status: string;
+  sourceLabelMap: Record<string, string>;
+  onFocusSource: (nodeId: string | null) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const latest = checkpoints[checkpoints.length - 1];
+  if (!latest) {
+    return null;
   }
-}
-
-function writeLocalRuntimeSettings(settings: LocalRuntimeSettings) {
-  try {
-    window.localStorage.setItem(localRuntimeSettingsKey, JSON.stringify(settings));
-  } catch {
-    // Local persistence is a convenience; unavailable storage should not block a run.
-  }
-}
-
-function savedProviderConfig(fallback: ProviderConfig) {
-  const saved = readLocalRuntimeSettings().providerConfig ?? {};
-  return {
-    ...fallback,
-    ...saved
-  };
+  const visibleCheckpoints = expanded ? [...checkpoints].reverse() : [latest];
+  return (
+    <section className={`live-brief-panel ${status === "completed" ? "replay" : ""}`} aria-label={status === "completed" ? "Replay Process" : "Live Brief"}>
+      <header>
+        <span>{status === "completed" ? "REPLAY PROCESS" : "LIVE BRIEF"}</span>
+        <button type="button" onClick={() => setExpanded((value) => !value)} aria-label={expanded ? "Collapse checkpoints" : "Expand checkpoints"}>
+          {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+          {checkpoints.length}
+        </button>
+      </header>
+      <div className="live-brief-list">
+        {visibleCheckpoints.map((checkpoint) => {
+          const focusId = checkpoint.sourceNodeIds[0] ?? null;
+          return (
+            <article className="live-brief-card" key={checkpoint.id}>
+              <button type="button" onClick={() => onFocusSource(focusId)} disabled={!focusId}>
+                <small>{checkpoint.phase}</small>
+                <strong>{checkpoint.title}</strong>
+              </button>
+              <p>{checkpoint.summary}</p>
+              <div className="live-brief-grid">
+                <div>
+                  <span>Known</span>
+                  {checkpoint.knownFacts.slice(0, 3).map((fact) => <em key={`${checkpoint.id}-${fact}`}>{fact}</em>)}
+                </div>
+                <div>
+                  <span>Open</span>
+                  {checkpoint.openQuestions.slice(0, 2).map((question) => <em key={`${checkpoint.id}-${question}`}>{question}</em>)}
+                </div>
+              </div>
+              <footer>
+                <CheckCircle2 size={14} />
+                <span>{checkpoint.nextAction}</span>
+              </footer>
+              {checkpoint.sourceNodeIds.length > 0 && (
+                <div className="live-brief-sources">
+                  {checkpoint.sourceNodeIds.slice(0, 4).map((nodeId) => (
+                    <button key={`${checkpoint.id}-${nodeId}`} type="button" onClick={() => onFocusSource(nodeId)}>
+                      {sourceLabelMap[nodeId] ?? nodeId}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
 }
 
 export function App() {
   const { state, submitTask, pause, resume, cancel, reset, retryTool, excludeEvidence } = useMindstream();
-  const [runMode, setRunMode] = useState<RunMode>(defaultRunRequest().runMode);
   const [scene, setScene] = useState<GraphSceneSnapshot>(emptyScene);
   const [viewport, setViewport] = useState({ width: 1440, height: 900 });
   const [reportFocusNodeId, setReportFocusNodeId] = useState<string | null>(null);
   const [taskDraft, setTaskDraft] = useState(defaultRunRequest().question);
-  const [scopeDraft, setScopeDraft] = useState(defaultRunRequest().scope);
-  const [tavilyApiKey, setTavilyApiKey] = useState(() => readLocalRuntimeSettings().tavilyApiKey ?? defaultRunRequest().tavilyApiKey ?? "");
-  const [braveApiKey, setBraveApiKey] = useState(() => readLocalRuntimeSettings().braveApiKey ?? defaultRunRequest().braveApiKey ?? "");
-  const [firecrawlApiKey, setFirecrawlApiKey] = useState(() => readLocalRuntimeSettings().firecrawlApiKey ?? defaultRunRequest().firecrawlApiKey ?? "");
-  const [exaApiKey, setExaApiKey] = useState(() => readLocalRuntimeSettings().exaApiKey ?? defaultRunRequest().exaApiKey ?? "");
-  const [providerConfig, setProviderConfig] = useState<ProviderConfig>(() => savedProviderConfig(defaultRunRequest().providerConfig));
-  const [calibrationQueue, setCalibrationQueue] = useState<string[]>([]);
-  const [calibrationIndex, setCalibrationIndex] = useState<number | null>(null);
+  const [submitLocked, setSubmitLocked] = useState(false);
   const currentPhaseIndex = getPhaseIndex(state.phase);
   const progress = state.status === "completed" ? 100 : Math.min(98, Math.round((state.elapsed / 30000) * 100));
   const latestEvent = state.events[state.events.length - 1];
@@ -122,6 +136,8 @@ export function App() {
   const centerHeadline = state.status === "failed" ? "运行失败，需要处理工具错误" : phaseCopy[state.phase];
   const centerEventLine = state.status === "failed" && state.error
     ? state.error
+    : state.status === "queued"
+      ? "正在连接运行时、创建 run，并加载服务端搜索与模型配置。"
     : latestEvent?.message ?? "提交一个调研问题，Agent 将真实调用工具，并把检索、读取、证据、判断和报告写作过程实时映射到图谱。";
   const handleSceneUpdate = useCallback((nextScene: GraphSceneSnapshot) => {
     setScene(nextScene);
@@ -154,95 +170,58 @@ export function App() {
   }, [state.status]);
 
   useEffect(() => {
-    writeLocalRuntimeSettings({
-      tavilyApiKey,
-      braveApiKey,
-      firecrawlApiKey,
-      exaApiKey,
-      providerConfig
-    });
-  }, [braveApiKey, exaApiKey, firecrawlApiKey, providerConfig, tavilyApiKey]);
+    if (state.status === "idle" || state.status === "completed" || state.status === "failed" || state.status === "cancelled") {
+      setSubmitLocked(false);
+    }
+  }, [state.status]);
 
   const handleReplay = useCallback(() => {
     setReportFocusNodeId(null);
     submitTask({
       question: state.run?.question ?? (taskDraft.trim() || defaultRunRequest().question),
-      scope: state.run?.scope ?? (scopeDraft.trim() || defaultRunRequest().scope),
+      scope: state.run?.scope ?? defaultRunRequest().scope,
       depth: state.run?.depth ?? "standard",
       sources: state.run?.sources ?? ["web_search", "web_fetch", "document_read"],
-      runMode: state.run?.runMode ?? runMode,
-      tavilyApiKey,
-      braveApiKey,
-      firecrawlApiKey,
-      exaApiKey,
-      providerConfig
+      runMode: "live",
+      providerConfig: defaultRunRequest().providerConfig
     });
-  }, [braveApiKey, exaApiKey, firecrawlApiKey, providerConfig, runMode, scopeDraft, state.run, submitTask, taskDraft, tavilyApiKey]);
+  }, [state.run, submitTask, taskDraft]);
 
   const handleReset = useCallback(() => {
     setReportFocusNodeId(null);
-    setCalibrationQueue([]);
-    setCalibrationIndex(null);
+    setSubmitLocked(false);
     reset();
   }, [reset]);
 
-  const updateProvider = useCallback(<Key extends keyof ProviderConfig>(key: Key, value: ProviderConfig[Key]) => {
-    setProviderConfig((current) => ({ ...current, [key]: value }));
-  }, []);
-
-  const buildRequest = useCallback((question: string, scope: string = scopeDraft.trim() || defaultRunRequest().scope) => ({
+  const buildRequest = useCallback((question: string) => ({
     question: question.trim() || defaultRunRequest().question,
-    scope,
+    scope: defaultRunRequest().scope,
     depth: "standard" as const,
     sources: ["web_search", "web_fetch", "document_read"],
-    runMode,
-    tavilyApiKey,
-    braveApiKey,
-    firecrawlApiKey,
-    exaApiKey,
-    providerConfig
-  }), [braveApiKey, exaApiKey, firecrawlApiKey, providerConfig, runMode, scopeDraft, tavilyApiKey]);
+    runMode: "live" as const,
+    providerConfig: defaultRunRequest().providerConfig
+  }), []);
 
   const handleSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    setReportFocusNodeId(null);
-    setCalibrationQueue([]);
-    setCalibrationIndex(null);
-    submitTask(buildRequest(taskDraft, scopeDraft.trim() || defaultRunRequest().scope));
-  }, [buildRequest, scopeDraft, submitTask, taskDraft]);
-
-  const handleStartCalibration = useCallback(() => {
-    setReportFocusNodeId(null);
-    const [firstTopic] = calibrationTopics;
-    setCalibrationQueue([]);
-    setCalibrationIndex(1);
-    setTaskDraft(firstTopic);
-    setScopeDraft("完整长跑校准：验证真实 API 调用、工具观察分析、报告生成和导出链路。");
-    submitTask(buildRequest(firstTopic, "完整长跑校准：验证真实 API 调用、工具观察分析、报告生成和导出链路。"));
-  }, [buildRequest, submitTask]);
-
-  useEffect(() => {
-    if (state.status === "completed") {
-      setCalibrationQueue([]);
-      setCalibrationIndex(null);
-    }
-  }, [state.status]);
-
-  useEffect(() => {
-    if (state.status === "failed" || state.status === "cancelled") {
-      setCalibrationQueue([]);
-      setCalibrationIndex(null);
-    }
-  }, [state.status]);
-
-  const exportRun = useCallback((format: "markdown" | "json") => {
-    if (!state.run) {
+    if (state.status !== "idle" || submitLocked) {
       return;
     }
-    window.open(`/api/runs/${state.run.id}/export?format=${format}`, "_blank", "noopener,noreferrer");
-  }, [state.run]);
+    setSubmitLocked(true);
+    setReportFocusNodeId(null);
+    submitTask(buildRequest(taskDraft));
+  }, [buildRequest, state.status, submitLocked, submitTask, taskDraft]);
+
+  const exportRun = useCallback((format: ReportExportFormat) => {
+    if (!state.run || !state.finalReport) {
+      return;
+    }
+    exportReport(state, sourceLabelMap, format);
+  }, [sourceLabelMap, state]);
 
   const isRunning = state.status === "running" || state.status === "queued";
+  const isStarting = state.status === "queued" || submitLocked;
+  const canRetryLatestError = Boolean(latestErrorLog?.retryable && latestErrorLog.toolCallId);
 
   return (
     <main className={`app-shell phase-${state.phase}`}>
@@ -339,12 +318,17 @@ export function App() {
             <strong>{latestErrorLog.errorType}</strong>
             <span>{latestErrorLog.toolName || "runtime"} · {latestErrorLog.phase}</span>
             <p>{latestErrorLog.nextAction}</p>
+            {canRetryLatestError && (
+              <button type="button" onClick={() => void retryTool(latestErrorLog.toolCallId)}>
+                Retry failed tool
+              </button>
+            )}
           </motion.div>
         )}
       </section>
 
       <AnimatePresence>
-        {state.status === "idle" && (
+        {(state.status === "idle" || state.status === "queued") && (
           <motion.form
             className="task-composer"
             onSubmit={handleSubmit}
@@ -353,145 +337,17 @@ export function App() {
             exit={{ opacity: 0, y: 20, filter: "blur(10px)" }}
             transition={{ duration: 0.48, ease: [0.16, 1, 0.3, 1] }}
           >
-            <span>{runMode === "demo" ? "DEMO AGENT RUN" : "LIVE AGENT RUN"}</span>
+            <span>LIVE AGENT RUN</span>
             <label>
               <strong>Research Question</strong>
-              <textarea value={taskDraft} onChange={(event) => setTaskDraft(event.target.value)} rows={4} />
+              <textarea value={taskDraft} onChange={(event) => setTaskDraft(event.target.value)} rows={4} disabled={isStarting} />
             </label>
-            <label>
-              <strong>Scope</strong>
-              <input value={scopeDraft} onChange={(event) => setScopeDraft(event.target.value)} />
-            </label>
-            <div className="provider-config" aria-label="Provider configuration">
-              <div className="run-mode-switch" aria-label="Run mode">
-                {(["demo", "live"] as RunMode[]).map((mode) => (
-                  <button
-                    className={runMode === mode ? "active" : ""}
-                    key={mode}
-                    type="button"
-                    onClick={() => setRunMode(mode)}
-                    aria-pressed={runMode === mode}
-                  >
-                    {mode === "demo" ? "Demo" : "Live"}
-                  </button>
-                ))}
-              </div>
-              <div className="provider-config-header">
-                <strong>Provider</strong>
-                <span>{providerConfig.protocol} · {providerConfig.model} · {maskedProvider(providerConfig)}</span>
-              </div>
-              <div className="protocol-switch" aria-label="API protocol">
-                {(["openai", "anthropic"] as ProviderProtocol[]).map((protocol) => (
-                  <button
-                    className={providerConfig.protocol === protocol ? "active" : ""}
-                    key={protocol}
-                    type="button"
-                    onClick={() => updateProvider("protocol", protocol)}
-                    aria-pressed={providerConfig.protocol === protocol}
-                  >
-                    {protocol === "openai" ? "OpenAI" : "Anthropic"}
-                  </button>
-                ))}
-              </div>
-              <label>
-                <strong>OpenAI Base URL</strong>
-                <input value={providerConfig.baseUrl} onChange={(event) => updateProvider("baseUrl", event.target.value)} />
-              </label>
-              <label>
-                <strong>Anthropic Base URL</strong>
-                <input value={providerConfig.anthropicBaseUrl} onChange={(event) => updateProvider("anthropicBaseUrl", event.target.value)} />
-              </label>
-              <div className="provider-grid">
-                <label>
-                  <strong>Model</strong>
-                  <input value={providerConfig.model} onChange={(event) => updateProvider("model", event.target.value)} />
-                </label>
-                <label>
-                  <strong>Temperature</strong>
-                  <input
-                    max="1"
-                    min="0"
-                    step="0.05"
-                    type="number"
-                    value={providerConfig.temperature}
-                    onChange={(event) => updateProvider("temperature", Number(event.target.value))}
-                  />
-                </label>
-                <label>
-                  <strong>Max Tokens</strong>
-                  <input
-                    min="256"
-                    step="128"
-                    type="number"
-                    value={providerConfig.maxTokens}
-                    onChange={(event) => updateProvider("maxTokens", Number(event.target.value))}
-                  />
-                </label>
-              </div>
-              <label>
-                <strong>Tavily Search API Key</strong>
-                <input
-                  autoComplete="off"
-                  placeholder="Paste Tavily key"
-                  type="password"
-                  value={tavilyApiKey}
-                  onChange={(event) => setTavilyApiKey(event.target.value)}
-                />
-              </label>
-              <label>
-                <strong>Brave Search API Key</strong>
-                <input
-                  autoComplete="off"
-                  placeholder="Optional Brave fallback key"
-                  type="password"
-                  value={braveApiKey}
-                  onChange={(event) => setBraveApiKey(event.target.value)}
-                />
-              </label>
-              <label>
-                <strong>Firecrawl API Key</strong>
-                <input
-                  autoComplete="off"
-                  placeholder="Optional search/scrape fallback key"
-                  type="password"
-                  value={firecrawlApiKey}
-                  onChange={(event) => setFirecrawlApiKey(event.target.value)}
-                />
-              </label>
-              <label>
-                <strong>Exa API Key</strong>
-                <input
-                  autoComplete="off"
-                  placeholder="Optional MCP semantic search key"
-                  type="password"
-                  value={exaApiKey}
-                  onChange={(event) => setExaApiKey(event.target.value)}
-                />
-              </label>
-              <label>
-                <strong>LLM API Key</strong>
-                <input
-                  autoComplete="off"
-                  placeholder="Paste runtime key"
-                  type="password"
-                  value={providerConfig.apiKey}
-                  onChange={(event) => updateProvider("apiKey", event.target.value)}
-                />
-              </label>
-            </div>
             <div className="composer-actions">
-              <button type="submit">
-                <Send size={16} />
-                {runMode === "demo" ? "Start demo process" : "Start live process"}
-              </button>
-              <button className="secondary-action" type="button" onClick={handleStartCalibration}>
-                <FlaskConical size={16} />
-                Full calibration
+              <button type="submit" disabled={isStarting}>
+                {isStarting ? <Loader2 className="spin-icon" size={16} /> : <Send size={16} />}
+                {isStarting ? "Starting live process..." : "Start live process"}
               </button>
             </div>
-            {calibrationIndex !== null && (
-              <p className="calibration-status">Calibration {calibrationIndex} / {calibrationTopics.length}</p>
-            )}
           </motion.form>
         )}
       </AnimatePresence>
@@ -540,6 +396,13 @@ export function App() {
           </button>
         </div>
       </section>
+
+      <LiveBriefPanel
+        checkpoints={state.checkpoints}
+        status={state.status}
+        sourceLabelMap={sourceLabelMap}
+        onFocusSource={setReportFocusNodeId}
+      />
 
       <ForceNebulaGraph
         nodes={state.graphNodes}

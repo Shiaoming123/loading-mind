@@ -283,11 +283,36 @@ export type ReportSection = {
   sourceNodeIds: string[];
 };
 
+export type ThinkingCheckpoint = {
+  id: string;
+  phase: LoadingPhase;
+  title: string;
+  summary: string;
+  knownFacts: string[];
+  openQuestions: string[];
+  nextAction: string;
+  sourceNodeIds: string[];
+  createdAt: number;
+};
+
+export type ReportQualityScore = {
+  score: number;
+  passed: boolean;
+  issues: string[];
+  repairSuggestions: string[];
+  dimensions: Array<{
+    id: string;
+    label: string;
+    passed: boolean;
+  }>;
+};
+
 export type ClaimGraphClaim = {
   id: string;
   label: string;
   status?: string;
-  supportCount?: number;
+  reviewState?: string;
+  sourceCount?: number;
   confidence?: number;
   evidenceIds?: string[];
   sourceTitles?: string[];
@@ -343,6 +368,7 @@ export type Artifact = {
   sections?: ReportSection[];
   blocks?: ArtifactBlock[];
   sourceLabelMap?: Record<string, string>;
+  quality?: ReportQualityScore;
 };
 
 export type LoadingEvent = {
@@ -351,6 +377,7 @@ export type LoadingEvent = {
   timestamp: number;
   message: string;
   graphEvent?: GraphEvent;
+  checkpoint?: ThinkingCheckpoint;
   finalReport?: Artifact;
 };
 
@@ -371,6 +398,7 @@ export type AgentEventType =
   | "run_cancelled"
   | "run_completed"
   | "retry_recorded"
+  | "checkpoint_created"
   | "run_failed";
 
 export type AgentRun = {
@@ -399,6 +427,7 @@ export type AgentEvent = {
   graphEvent?: GraphEvent;
   toolCall?: ToolCallRecord;
   evidence?: EvidenceRecord;
+  checkpoint?: ThinkingCheckpoint;
   finalReport?: Artifact;
   error?: string;
   errorLog?: RunErrorLog;
@@ -413,6 +442,7 @@ export type MindstreamState = {
   elapsed: number;
   events: LoadingEvent[];
   agentEvents: AgentEvent[];
+  checkpoints: ThinkingCheckpoint[];
   graphNodes: GraphNode[];
   graphEdges: GraphEdge[];
   formedClusters: GraphCluster[];

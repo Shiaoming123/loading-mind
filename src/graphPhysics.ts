@@ -101,6 +101,8 @@ const edgePriority: Record<GraphEdgeKind, number> = {
   extracts: 1
 };
 
+const executionStepCount = 8;
+
 type GraphEdgeRelation = Pick<GraphEdge, "id" | "from" | "to" | "kind"> & {
   relationKinds?: GraphEdgeKind[];
 };
@@ -323,6 +325,21 @@ export function clusterAnchor(cluster: GraphCluster | undefined, viewport: Graph
   }
 }
 
+export function nodeLayoutAnchor(node: GraphNode, viewport: GraphViewport) {
+  if (!node.executionStep) {
+    return clusterAnchor(node.cluster, viewport);
+  }
+
+  const bounds = sceneBounds(viewport);
+  const compact = viewport.width < 760;
+  const progress = Math.max(0, Math.min(1, (node.executionStep.stepIndex - 1) / (executionStepCount - 1)));
+  const laneJitter = (stableHash(node.id) - 0.5) * bounds.height * (compact ? 0.18 : 0.14);
+  return {
+    x: bounds.left + bounds.width * (compact ? 0.5 : 0.12 + progress * 0.76),
+    y: bounds.top + bounds.height * (compact ? 0.18 + progress * 0.64 : 0.52) + laneJitter
+  };
+}
+
 export function initialNodePosition(
   node: GraphNode,
   viewport: GraphViewport,
@@ -331,9 +348,9 @@ export function initialNodePosition(
   const parent = node.parentId ? existing.get(node.parentId) : null;
   const hash = stableHash(node.id);
   const angle = hash * Math.PI * 2;
-  const anchor = clusterAnchor(node.cluster, viewport);
+  const anchor = nodeLayoutAnchor(node, viewport);
 
-  if (parent) {
+  if (parent && !node.executionStep) {
     const distance = 42 + hash * 34;
     return {
       x: (parent.x ?? anchor.x) + Math.cos(angle) * distance,
@@ -352,6 +369,49 @@ export function initialNodePosition(
     x: anchor.x + Math.cos(angle) * 24,
     y: anchor.y + Math.sin(angle) * 24
   };
+}
+
+export function graphLinkDistance(edge: Pick<ForceGraphEdge, "distance" | "kind" | "relationCount">) {
+  if (typeof edge.distance === "number") {
+    return edge.distance;
+  }
+  if (edge.kind === "execution_flow") {
+    return 132;
+  }
+  if (edge.kind === "becomes_section" || edge.kind === "feeds_visual") {
+    return 124;
+  }
+  if (edge.kind === "uses_tool" || edge.kind === "observes") {
+    return 118;
+  }
+  if (edge.relationCount > 1) {
+    return 112;
+  }
+  return 138;
+}
+
+export function graphLinkStrength(edge: Pick<ForceGraphEdge, "strength" | "kind" | "relationCount">) {
+  if (typeof edge.strength === "number") {
+    return edge.strength;
+  }
+  if (edge.kind === "execution_flow") {
+    return 0.86;
+  }
+  if (edge.kind === "becomes_section" || edge.kind === "feeds_visual") {
+    return 0.58;
+  }
+  if (edge.kind === "uses_tool" || edge.kind === "observes" || edge.kind === "retry_of") {
+    return 0.5;
+  }
+  if (edge.relationCount > 1) {
+    return 0.48;
+  }
+  return 0.34;
+}
+
+export function collisionRadius(node: ForceGraphNode) {
+  const labelBuffer = node.tier === "core" || node.tier === "output" || node.kind === "ontology" ? 18 : 10;
+  return node.radius + 12 + labelBuffer * Math.max(0.35, node.importance);
 }
 
 export function clampToViewport(node: ForceGraphNode, viewport: GraphViewport) {

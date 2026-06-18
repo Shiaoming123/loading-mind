@@ -1,5 +1,6 @@
 import { agentEventToLoadingEvent } from "./agentProtocol";
-import type { AgentEvent, AgentRun, GraphEvent, GraphNode, LoadingEvent, MindstreamState } from "./types";
+import type { CreateRunRequest } from "./agentProtocol";
+import type { AgentEvent, AgentRun, GraphEdge, GraphEvent, GraphNode, LoadingEvent, MindstreamState, ThinkingCheckpoint } from "./types";
 
 export const initialState: MindstreamState = {
   status: "idle",
@@ -8,6 +9,7 @@ export const initialState: MindstreamState = {
   elapsed: 0,
   events: [],
   agentEvents: [],
+  checkpoints: [],
   graphNodes: [],
   graphEdges: [],
   formedClusters: [],
@@ -19,6 +21,7 @@ export const initialState: MindstreamState = {
 };
 
 export type MindstreamAction =
+  | { type: "BEGIN_SUBMIT"; request?: CreateRunRequest }
   | { type: "START"; run: AgentRun }
   | { type: "RESET" }
   | { type: "PAUSE" }
@@ -38,6 +41,108 @@ function upsertNode(nodes: GraphNode[], nextNode: GraphNode) {
   }
 
   return nodes.map((node, nodeIndex) => (nodeIndex === index ? { ...node, ...nextNode } : node));
+}
+
+function optimisticSubmitGraph(request?: CreateRunRequest): Pick<MindstreamState, "graphNodes" | "graphEdges" | "formedClusters"> {
+  const question = request?.question?.trim() || "正在建立研究任务";
+  const scope = request?.scope?.trim() || "等待 runtime 返回真实执行事件";
+  const graphNodes: GraphNode[] = [
+    {
+      id: "task-intent",
+      kind: "task_intent",
+      label: "深度研究任务",
+      shortBody: scope,
+      summary: question,
+      status: "running",
+      cluster: "intent",
+      salience: 1,
+      confidence: 0.72,
+      attributes: {
+        question,
+        scope,
+        depth: request?.depth ?? "standard",
+        runMode: request?.runMode ?? "live"
+      },
+      episodes: [{
+        id: "optimistic-task-intent",
+        time: "00:00",
+        title: "任务已提交",
+        detail: "前端已建立可视化 seed，正在等待 runtime 创建 run 并返回真实事件。"
+      }],
+      executionStep: {
+        stepId: "plan",
+        stepIndex: 1,
+        stepLabel: "Plan",
+        stepStatus: "queued"
+      }
+    },
+    {
+      id: "ontology-runtime",
+      kind: "ontology",
+      label: "深研过程本体",
+      shortBody: "预建立任务、计划、工具、证据和报告章节的语义骨架。",
+      summary: "该节点说明本次运行会把 Agent 的计划、检索、读取、证据抽取、验证和报告写作映射为可检查的图谱节点。",
+      status: "queued",
+      cluster: "ontology",
+      parentId: "task-intent",
+      salience: 0.78,
+      confidence: 0.68,
+      attributes: {
+        nodeTypes: "research_plan, search_query, source, evidence, claim, section",
+        state: "optimistic"
+      }
+    },
+    {
+      id: "research-plan",
+      kind: "research_plan",
+      label: "研究计划",
+      shortBody: "等待 ResearchPlanner 生成问题树、检索分支和验证维度。",
+      summary: `即将把“${question}”拆成检索分支、来源读取、证据抽取、质量检查和报告写作步骤。`,
+      status: "queued",
+      cluster: "plan",
+      parentId: "ontology-runtime",
+      salience: 0.86,
+      confidence: 0.66,
+      attributes: {
+        state: "queued",
+        next: "等待服务端计划事件"
+      },
+      executionStep: {
+        stepId: "plan",
+        stepIndex: 1,
+        stepLabel: "Plan",
+        stepStatus: "queued"
+      }
+    }
+  ];
+  const graphEdges: GraphEdge[] = [
+    {
+      id: "edge-task-ontology",
+      from: "task-intent",
+      to: "ontology-runtime",
+      kind: "extracts",
+      label: "extracts ontology",
+      confidence: 0.7,
+      distance: 104,
+      strength: 0.72
+    },
+    {
+      id: "edge-ontology-plan",
+      from: "ontology-runtime",
+      to: "research-plan",
+      kind: "extracts",
+      label: "extracts plan",
+      confidence: 0.68,
+      distance: 116,
+      strength: 0.72
+    }
+  ];
+
+  return {
+    graphNodes,
+    graphEdges,
+    formedClusters: ["intent", "ontology", "plan"]
+  };
 }
 
 function applyGraphEvent(state: MindstreamState, graphEvent: GraphEvent | undefined) {
@@ -89,6 +194,13 @@ function applyGraphEvent(state: MindstreamState, graphEvent: GraphEvent | undefi
   };
 }
 
+function appendCheckpoint(checkpoints: ThinkingCheckpoint[], checkpoint: ThinkingCheckpoint | undefined) {
+  if (!checkpoint || checkpoints.some((item) => item.id === checkpoint.id)) {
+    return checkpoints;
+  }
+  return [...checkpoints, checkpoint];
+}
+
 function statusFromAgentEvent(state: MindstreamState, event: AgentEvent): MindstreamState["status"] {
   if (event.type === "run_completed") {
     return "completed";
@@ -115,11 +227,23 @@ export function mindstreamReducer(
   switch (action.type) {
     case "RESET":
       return initialState;
+    case "BEGIN_SUBMIT": {
+      const optimisticGraph = optimisticSubmitGraph(action.request);
+      return {
+        ...initialState,
+        status: "queued",
+        phase: "initializing",
+        ...optimisticGraph
+      };
+    }
     case "START":
       return {
         ...initialState,
         status: action.run.status,
-        run: action.run
+        run: action.run,
+        graphNodes: state.status === "queued" ? state.graphNodes : [],
+        graphEdges: state.status === "queued" ? state.graphEdges : [],
+        formedClusters: state.status === "queued" ? state.formedClusters : []
       };
     case "REPLAY":
       return {
@@ -172,6 +296,7 @@ export function mindstreamReducer(
         phase: action.event.phase,
         elapsed: Math.max(state.elapsed, action.event.timestamp),
         events: [...state.events, action.event],
+        checkpoints: appendCheckpoint(state.checkpoints, action.event.checkpoint),
         graphNodes: graphState.graphNodes,
         graphEdges: graphState.graphEdges,
         formedClusters: graphState.formedClusters,
@@ -196,6 +321,7 @@ export function mindstreamReducer(
           ? state.events
           : [...state.events, loadingEvent],
         agentEvents: [...state.agentEvents, action.event],
+        checkpoints: appendCheckpoint(state.checkpoints, action.event.checkpoint),
         graphNodes: graphState.graphNodes,
         graphEdges: graphState.graphEdges,
         formedClusters: graphState.formedClusters,

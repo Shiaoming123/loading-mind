@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { defaultRunRequest } from "./agentProtocol";
 import { getTimeline } from "./demoData";
 import { initialState, mindstreamReducer } from "./mindstreamReducer";
 import type { AgentRun } from "./types";
@@ -15,6 +16,35 @@ const run: AgentRun = {
 };
 
 describe("mindstreamReducer", () => {
+  it("enters queued state with an immediate explainable seed graph", () => {
+    const queued = mindstreamReducer(initialState, {
+      type: "BEGIN_SUBMIT",
+      request: {
+        ...defaultRunRequest(),
+        question: "社区咖啡机器人怎么落地？",
+        scope: "商业选址和运营验证"
+      }
+    });
+
+    expect(queued.status).toBe("queued");
+    expect(queued.phase).toBe("initializing");
+    expect(queued.run).toBeNull();
+    expect(queued.graphNodes.map((node) => node.id)).toEqual(["task-intent", "ontology-runtime", "research-plan"]);
+    expect(queued.graphEdges.map((edge) => edge.id)).toEqual(["edge-task-ontology", "edge-ontology-plan"]);
+    expect(queued.formedClusters).toEqual(["intent", "ontology", "plan"]);
+    expect(queued.graphNodes[0].summary).toBe("社区咖啡机器人怎么落地？");
+    expect(queued.graphNodes[2].summary).toContain("社区咖啡机器人怎么落地？");
+  });
+
+  it("preserves the seed graph when the created run starts before events stream in", () => {
+    const queued = mindstreamReducer(initialState, { type: "BEGIN_SUBMIT", request: defaultRunRequest() });
+    const started = mindstreamReducer(queued, { type: "START", run });
+
+    expect(started.status).toBe("running");
+    expect(started.run).toBe(run);
+    expect(started.graphNodes.map((node) => node.id)).toEqual(["task-intent", "ontology-runtime", "research-plan"]);
+  });
+
   it("starts from idle and applies a graph event once", () => {
     const running = mindstreamReducer(initialState, { type: "START", run });
     const withOntology = mindstreamReducer(running, {
@@ -51,6 +81,48 @@ describe("mindstreamReducer", () => {
     });
 
     expect(duplicate.events).toHaveLength(1);
+  });
+
+  it("collects thinking checkpoints from agent events without duplicates", () => {
+    const running = mindstreamReducer(initialState, { type: "START", run });
+    const checkpoint = {
+      id: "checkpoint-search",
+      phase: "graph_build" as const,
+      title: "Live Brief：搜索方向已收束",
+      summary: "已保留候选来源。",
+      knownFacts: ["Source A"],
+      openQuestions: ["Need benchmark?"],
+      nextAction: "读取来源正文。",
+      sourceNodeIds: ["source-1"],
+      createdAt: 1
+    };
+    const withCheckpoint = mindstreamReducer(running, {
+      type: "APPLY_AGENT_EVENT",
+      event: {
+        id: "checkpoint-event",
+        runId: run.id,
+        type: "checkpoint_created",
+        phase: "graph_build",
+        elapsedMs: 1000,
+        message: "checkpoint",
+        checkpoint
+      }
+    });
+    const duplicate = mindstreamReducer(withCheckpoint, {
+      type: "APPLY_AGENT_EVENT",
+      event: {
+        id: "checkpoint-event",
+        runId: run.id,
+        type: "checkpoint_created",
+        phase: "graph_build",
+        elapsedMs: 1000,
+        message: "checkpoint",
+        checkpoint
+      }
+    });
+
+    expect(withCheckpoint.checkpoints).toEqual([checkpoint]);
+    expect(duplicate.checkpoints).toHaveLength(1);
   });
 
   it("pauses and resumes only while running", () => {

@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Download, FileText, Printer, RotateCcw } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Download, FileText, PanelRightClose, PanelRightOpen, Printer, RotateCcw } from "lucide-react";
 import mermaid from "mermaid";
 import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -414,14 +414,32 @@ export function ReportDrawer({
   onExport: (format: ReportExportFormat) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [hidden, setHidden] = useState(false);
 
   useEffect(() => {
     setExpanded(false);
+    setHidden(false);
   }, [artifact?.id]);
 
   return (
     <AnimatePresence>
-      {artifact && (
+      {artifact && hidden && (
+        <motion.button
+          className="report-drawer-tab"
+          type="button"
+          onClick={() => setHidden(false)}
+          initial={{ opacity: 0, x: 24 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: 18 }}
+          transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+          aria-label="Show final report"
+          title="Show final report"
+        >
+          <PanelRightOpen size={16} />
+          <span>REPORT</span>
+        </motion.button>
+      )}
+      {artifact && !hidden && (
         <motion.section
           className={`report-drawer ${expanded ? "expanded" : "collapsed"}`}
           initial={{ opacity: 0, x: 36 }}
@@ -433,6 +451,9 @@ export function ReportDrawer({
           <header className="report-drawer-header">
             <span>{artifact.kind === "failure" ? "FAILURE REPORT" : "FINAL REPORT"}</span>
             <div className="report-drawer-actions">
+              <button type="button" onClick={() => setHidden(true)} aria-label="Hide final report" title="Hide final report">
+                <PanelRightClose size={16} />
+              </button>
               <button type="button" onClick={() => setExpanded((value) => !value)} aria-label={expanded ? "Collapse report" : "Expand report"} title={expanded ? "Collapse report" : "Expand report"}>
                 {expanded ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
               </button>

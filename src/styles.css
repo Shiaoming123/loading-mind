@@ -712,7 +712,7 @@ button {
 
 .node-inspector {
   position: fixed;
-  z-index: 7;
+  z-index: 10;
   right: 34px;
   top: 236px;
   width: min(330px, calc(100dvw - 68px));
@@ -1086,6 +1086,34 @@ button {
   background: rgba(255, 252, 244, 0.88);
   box-shadow: 0 28px 92px rgba(47, 43, 37, 0.16);
   backdrop-filter: blur(22px);
+}
+
+.report-drawer-tab {
+  position: fixed;
+  z-index: 8;
+  right: 34px;
+  top: 94px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(217, 130, 43, 0.26);
+  border-right: 0;
+  border-radius: 8px 0 0 8px;
+  padding: 10px 12px;
+  background: rgba(255, 252, 244, 0.86);
+  box-shadow: 0 16px 46px rgba(47, 43, 37, 0.13);
+  backdrop-filter: blur(18px);
+  color: var(--amber);
+  cursor: pointer;
+  font-family: "Avenir Next", "Helvetica Neue", sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+}
+
+.report-drawer-tab:hover {
+  border-color: rgba(217, 130, 43, 0.42);
+  background: rgba(255, 247, 232, 0.96);
 }
 
 .report-drawer.expanded {
@@ -1917,6 +1945,16 @@ button {
     margin-top: 18px;
     margin-bottom: 26px;
     max-height: none;
+  }
+
+  .report-drawer-tab {
+    position: relative;
+    top: auto;
+    right: auto;
+    width: max-content;
+    margin-top: 18px;
+    border-right: 1px solid rgba(217, 130, 43, 0.26);
+    border-radius: 8px;
   }
 
   .report-drawer.expanded {

@@ -7,6 +7,7 @@ import {
   parseProviderJson,
   pickMimoModel,
   providerDefaults,
+  sanitizeProviderConfig,
   shouldDiscoverModel
 } from "./providerClient.mjs";
 
@@ -27,7 +28,7 @@ describe("providerClient", () => {
     expect(request.headers["api-key"]).toBeUndefined();
     expect(request.body.model).toBe("deepseek-v4-flash");
     expect(request.body.messages).toEqual(messages);
-    expect(request.body.max_tokens).toBe(providerDefaults.maxTokens);
+    expect(request.body.max_tokens).toBe(16000);
   });
 
   it("builds MiMo Token Plan requests with api-key auth", () => {
@@ -92,6 +93,13 @@ describe("providerClient", () => {
     expect(result.rawUsage.total_tokens).toBe(123);
     expect(result.latencyMs).toBe(42);
     expect(result.format).toBe("json");
+    expect(result.rawJson.summary).toBe("ok");
+  });
+
+  it("accepts large provider token budgets and clamps only at the hard cap", () => {
+    expect(providerDefaults.maxTokens).toBe(16000);
+    expect(sanitizeProviderConfig({ maxTokens: 16000 }).maxTokens).toBe(16000);
+    expect(sanitizeProviderConfig({ maxTokens: 999999 }).maxTokens).toBe(32000);
   });
 
   it("recovers non-empty non-JSON provider text into markdown sections", () => {

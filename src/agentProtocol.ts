@@ -56,7 +56,7 @@ export function defaultRunRequest(): CreateRunRequest {
       apiKey: "",
       model: "deepseek-v4-flash",
       temperature: 0.35,
-      maxTokens: 2200
+      maxTokens: 16000
     }
   };
 }

@@ -8,7 +8,7 @@ export const providerDefaults = {
   anthropicBaseUrl: defaultAnthropicBaseUrl,
   model: defaultModel,
   temperature: 0.35,
-  maxTokens: 2200
+  maxTokens: 16000
 };
 
 export function maskApiKey(apiKey = "") {
@@ -33,7 +33,7 @@ export function sanitizeProviderConfig(input = {}) {
     apiKey: String(input.apiKey || "").trim(),
     model: String(input.model || providerDefaults.model).trim() || providerDefaults.model,
     temperature: Number.isFinite(temperature) ? Math.min(1, Math.max(0, temperature)) : providerDefaults.temperature,
-    maxTokens: Number.isFinite(maxTokens) ? Math.min(4000, Math.max(256, Math.floor(maxTokens))) : providerDefaults.maxTokens
+    maxTokens: Number.isFinite(maxTokens) ? Math.min(32000, Math.max(256, Math.floor(maxTokens))) : providerDefaults.maxTokens
   };
 }
 
@@ -212,7 +212,8 @@ export function normalizeProviderResult(protocol, data, latencyMs) {
       rawUsage: data?.usage ?? null,
       latencyMs,
       format: "raw_markdown_recovered",
-      parseError
+      parseError,
+      rawJson: null
     };
   }
   const sections = Array.isArray(parsed.sections)
@@ -228,7 +229,8 @@ export function normalizeProviderResult(protocol, data, latencyMs) {
     sections,
     rawUsage: data?.usage ?? null,
     latencyMs,
-    format: "json"
+    format: "json",
+    rawJson: parsed
   };
 }
 

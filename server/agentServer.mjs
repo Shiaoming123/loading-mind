@@ -3592,6 +3592,367 @@ async function waitUntilRunnable(run) {
   }
 }
 
+const AGENT_SEARCH_MAX_ROUNDS = 4;
+
+function hasConfiguredLiveSearchProvider(run) {
+  return Boolean(
+    tavilyApiKey(run.tavilyApiKey)
+    || braveSearchApiKey(run.braveApiKey)
+    || firecrawlApiKey(run.firecrawlApiKey)
+  );
+}
+
+function shouldUseLlmSearchPlanner(run) {
+  return run.meta.runMode === "live" && !run.forceDemoTools;
+}
+
+function providerSearchPlannerMessages({ run, plan, observations, round }) {
+  return [
+    {
+      role: "system",
+      content: [
+        "LOADING_MIND_REACT_SEARCH_PLANNER",
+        "You are the Loading Mind ReAct search planner.",
+        "Return only strict JSON. Do not include markdown fences or prose outside JSON.",
+        "Allowed actions:",
+        "{\"action\":\"search\",\"query\":\"...\",\"rationale\":\"...\",\"expectedInformation\":\"...\"}",
+        "{\"action\":\"finish_search\",\"rationale\":\"...\",\"selectedSourceHints\":[\"...\"]}",
+        "{\"action\":\"fail\",\"rationale\":\"...\"}",
+        "The only executable tool is Tavily Search, exposed through action=search. The runtime executes the tool; you only propose the next action.",
+        "Search queries must be concrete, source-seeking, and no longer than 220 characters.",
+        "Finish only when the observations are enough to answer the user with source-backed conclusions."
+      ].join("\n")
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        question: run.meta.question,
+        scope: run.meta.scope,
+        depth: run.meta.depth,
+        sourceBudget: plan.sourceBudget,
+        round,
+        maxRounds: AGENT_SEARCH_MAX_ROUNDS,
+        researchQuestions: plan.researchQuestions,
+        outline: plan.outline,
+        officialSources: plan.officialSources?.map((source) => ({ title: source.title, url: source.url })) ?? [],
+        observations
+      })
+    }
+  ];
+}
+
+function normalizeAgentSearchAction(providerResult) {
+  const raw = providerResult?.rawJson;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("LLM search planner returned invalid action JSON");
+  }
+  const action = String(raw.action || "").trim();
+  const rationale = compactText(String(raw.rationale || raw.reason || ""), 420);
+  if (action === "search") {
+    const query = String(raw.query || "").replace(/\s+/g, " ").trim();
+    if (!query) {
+      throw new Error("LLM search planner emitted search without a query");
+    }
+    return {
+      action,
+      query: query.slice(0, 220),
+      rationale,
+      expectedInformation: compactText(String(raw.expectedInformation || raw.expected_information || ""), 260)
+    };
+  }
+  if (action === "finish_search") {
+    return {
+      action,
+      rationale,
+      selectedSourceHints: Array.isArray(raw.selectedSourceHints) ? raw.selectedSourceHints.map(String).slice(0, 8) : []
+    };
+  }
+  if (action === "fail") {
+    return {
+      action,
+      rationale: rationale || "LLM search planner failed without a rationale"
+    };
+  }
+  throw new Error(`LLM search planner emitted unsupported action: ${action || "empty"}`);
+}
+
+function appendSearchCompleteNode(run, { parentId, finishReason, rounds, sourceCount, rationale, planner }) {
+  nodeEvent(run, "graph_build", `搜索完成判断：${finishReason}。`, {
+    id: "agent-search-complete",
+    kind: "observation",
+    label: "搜索完成判断",
+    shortBody: `${sourceCount} sources / ${rounds} rounds`,
+    summary: rationale || `搜索 loop 因 ${finishReason} 停止。`,
+    status: "observed",
+    cluster: "search",
+    parentId,
+    salience: 0.78,
+    confidence: finishReason === "finish_search" || finishReason === "source_budget_reached" ? 0.82 : 0.62,
+    executionStep: executionStep("search"),
+    attributes: {
+      planner,
+      finishReason,
+      rounds: String(rounds),
+      sourceCount: String(sourceCount)
+    }
+  });
+  edgeEvent(run, "graph_build", "搜索 loop 停止判断进入汇总。", executionEdge("edge-agent-search-complete-summary", parentId, "agent-search-complete", 0.82));
+}
+
+async function runDeterministicSearchPlan({ run, registry, plan }) {
+  const queryNodes = plan.searchQueries.map((query, index) => ({
+    id: `query-${index + 1}`,
+    kind: "search_query",
+    label: `检索分支 ${index + 1}`,
+    shortBody: query,
+    summary: `该检索分支服务于“${topicLabel(run.meta.question)}”：${query}`,
+    status: "observed",
+    cluster: "search",
+    parentId: "research-plan",
+    salience: 0.72,
+    confidence: 0.84,
+    attributes: {
+      query,
+      branch: String(index + 1),
+      planner: "deterministic_fallback"
+    },
+    episodes: [{ id: `query-${index + 1}-episode`, time: `00:0${index + 6}`, title: "Search branch planned", detail: query }]
+  }));
+  for (const queryNode of queryNodes) {
+    nodeEvent(run, "graph_build", `搜索分支生成：${queryNode.shortBody}`, queryNode);
+    edgeEvent(run, "graph_build", "Research plan 发出检索 query。", { id: `edge-plan-${queryNode.id}`, from: "research-plan", to: queryNode.id, kind: "queries", confidence: 0.84 });
+  }
+  clusterEvent(run, "graph_build", "Search cluster 已形成。", "search");
+  await waitForRun(run, 700);
+  await waitUntilRunnable(run);
+
+  const searchSettled = await Promise.allSettled(queryNodes.map((queryNode) =>
+    runRegisteredTool(run, registry, "search", { query: queryNode.shortBody, queryId: queryNode.id }, {
+      nodeExtra: {
+        salience: 0.5,
+        importance: 0.46
+      }
+    })
+  ));
+  const searchResults = searchSettled
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => result.value);
+  const rejectedSearches = searchSettled.filter((result) => result.status === "rejected");
+  for (const result of searchResults) {
+    if (result.output.queryId) {
+      edgeEvent(run, "graph_build", "Search tool 读取对应 query。", {
+        id: `edge-${result.output.queryId}-${result.toolCall.id}`,
+        from: result.output.queryId,
+        to: result.toolCall.id,
+        kind: "uses_tool",
+        confidence: result.ok ? 0.8 : 0.32
+      });
+    }
+  }
+  return {
+    planner: "deterministic_fallback",
+    queryNodes,
+    searchResults,
+    rejectedSearches,
+    finishReason: "deterministic_queries_completed"
+  };
+}
+
+async function runLlmDrivenSearchPlan({ run, registry, plan }) {
+  if (!hasConfiguredLiveSearchProvider(run)) {
+    throw new Error("TAVILY_API_KEY, BRAVE_SEARCH_API_KEY, or FIRECRAWL_API_KEY is required for Live search");
+  }
+  if (!run.providerConfig?.apiKey) {
+    throw new Error("Provider API Key is required for LLM search planner");
+  }
+
+  const queryNodes = [];
+  const searchResults = [];
+  const rejectedSearches = [];
+  const observations = [];
+  let parentId = "research-plan";
+  let finishReason = "";
+  let finishRationale = "";
+
+  for (let round = 1; round <= AGENT_SEARCH_MAX_ROUNDS; round += 1) {
+    const decisionId = `agent-search-decision-${round}`;
+    nodeEvent(run, "graph_build", `LLM 搜索判断第 ${round} 轮开始。`, {
+      id: decisionId,
+      kind: "observation",
+      label: `LLM 搜索判断 ${round}`,
+      shortBody: "等待模型决定下一次工具调用",
+      summary: "Provider model 正在根据问题、范围和已有 observation 判断是否调用 Tavily Search。",
+      status: "running",
+      cluster: "search",
+      parentId,
+      salience: 0.82,
+      confidence: 0.76,
+      executionStep: executionStep("search", "running"),
+      attributes: {
+        planner: "llm_react",
+        round: String(round),
+        model: run.providerConfig.model,
+        allowedTool: "tavily.search"
+      }
+    });
+    edgeEvent(run, "graph_build", "上一轮 observation 进入 LLM 判断。", executionEdge(`edge-${parentId}-${decisionId}`, parentId, decisionId, 0.78));
+
+    const providerResult = await callProvider(run.providerConfig, providerSearchPlannerMessages({ run, plan, observations, round }), {
+      fetchImpl: run.fetchImpl,
+      timeoutMs: 45000
+    });
+    const action = normalizeAgentSearchAction(providerResult);
+    nodeEvent(run, "graph_build", `LLM 搜索判断第 ${round} 轮输出：${action.action}。`, {
+      id: decisionId,
+      kind: "observation",
+      label: `LLM 搜索判断 ${round}`,
+      shortBody: action.action === "search" ? action.query : action.action,
+      summary: action.rationale || `模型选择 ${action.action}。`,
+      status: "observed",
+      cluster: "search",
+      parentId,
+      salience: 0.84,
+      confidence: 0.78,
+      executionStep: executionStep("search"),
+      attributes: {
+        planner: "llm_react",
+        round: String(round),
+        action: action.action,
+        query: action.query || "",
+        rationale: action.rationale || "",
+        expectedInformation: action.expectedInformation || "",
+        model: run.providerConfig.model
+      }
+    }, "node_updated");
+
+    if (action.action === "fail") {
+      throw new Error(`LLM search planner failed: ${action.rationale}`);
+    }
+    if (action.action === "finish_search") {
+      finishReason = "finish_search";
+      finishRationale = action.rationale;
+      parentId = decisionId;
+      break;
+    }
+
+    const queryId = `query-${queryNodes.length + 1}`;
+    const queryNode = {
+      id: queryId,
+      kind: "search_query",
+      label: `LLM 检索 ${queryNodes.length + 1}`,
+      shortBody: action.query,
+      summary: action.rationale || `LLM 判断需要检索：${action.query}`,
+      status: "observed",
+      cluster: "search",
+      parentId: decisionId,
+      salience: 0.76,
+      confidence: 0.82,
+      executionStep: executionStep("search"),
+      attributes: {
+        query: action.query,
+        branch: String(queryNodes.length + 1),
+        planner: "llm_react",
+        rationale: action.rationale || "",
+        expectedInformation: action.expectedInformation || ""
+      },
+      episodes: [{ id: `${queryId}-episode`, time: `00:${String(6 + round).padStart(2, "0")}`, title: "LLM requested Tavily Search", detail: action.rationale || action.query }]
+    };
+    queryNodes.push(queryNode);
+    nodeEvent(run, "graph_build", `LLM 生成 Tavily query：${action.query}`, queryNode);
+    edgeEvent(run, "graph_build", "LLM 判断触发 Tavily 检索 query。", { id: `edge-${decisionId}-${queryId}`, from: decisionId, to: queryId, kind: "queries", confidence: 0.84 });
+
+    const result = await runRegisteredTool(run, registry, "search", { query: action.query, queryId }, {
+      nodeExtra: {
+        salience: 0.54,
+        importance: 0.46
+      }
+    });
+    searchResults.push(result);
+    edgeEvent(run, "graph_build", "Tavily Search 执行 LLM 提议的 query。", {
+      id: `edge-${queryId}-${result.toolCall.id}`,
+      from: queryId,
+      to: result.toolCall.id,
+      kind: "uses_tool",
+      confidence: result.ok ? 0.82 : 0.32
+    });
+
+    const items = result.output.items ?? [];
+    const observationId = `agent-search-observation-${round}`;
+    const observationSummary = result.ok
+      ? `Tavily 返回 ${items.length} 个来源候选：${items.slice(0, 3).map((item) => item.title || item.url).filter(Boolean).join(" / ")}`
+      : `Tavily 调用失败：${result.toolCall.error || "unknown error"}`;
+    nodeEvent(run, "graph_build", `搜索 observation 已记录：${items.length} 个候选来源。`, {
+      id: observationId,
+      kind: "observation",
+      label: `搜索观察 ${round}`,
+      shortBody: result.ok ? `${items.length} source candidates` : "search failed",
+      summary: observationSummary,
+      status: "observed",
+      cluster: "search",
+      parentId: result.toolCall.id,
+      salience: 0.66,
+      confidence: result.ok ? 0.76 : 0.34,
+      executionStep: executionStep("search", result.ok ? "completed" : "degraded"),
+      attributes: {
+        planner: "llm_react",
+        round: String(round),
+        query: action.query,
+        returnedSources: String(items.length),
+        provider: result.output.toolAttributes?.provider || "",
+        providerChain: result.output.toolAttributes?.providerChain || "",
+        error: result.toolCall.error || ""
+      }
+    });
+    edgeEvent(run, "graph_build", "Tavily observation 回流给下一轮 LLM 判断。", { id: `edge-${result.toolCall.id}-${observationId}`, from: result.toolCall.id, to: observationId, kind: "observes", confidence: result.ok ? 0.78 : 0.34 });
+    observations.push({
+      round,
+      query: action.query,
+      ok: result.ok,
+      returnedSources: items.length,
+      error: result.toolCall.error || "",
+      topResults: items.slice(0, 5).map((item) => ({
+        title: item.title,
+        url: item.url,
+        snippet: compactText(item.text, 180)
+      }))
+    });
+    parentId = observationId;
+
+    const sourceCount = dedupeSearchSources(
+      searchResults.filter(hasUsableSearchObservation).map((item) => item.output),
+      plan.sourceBudget
+    ).length;
+    if (sourceCount >= plan.sourceBudget) {
+      finishReason = "source_budget_reached";
+      finishRationale = `已达到 sourceBudget=${plan.sourceBudget}。`;
+      break;
+    }
+  }
+
+  const usableSourceCount = dedupeSearchSources(
+    searchResults.filter(hasUsableSearchObservation).map((item) => item.output),
+    plan.sourceBudget
+  ).length;
+  if (!finishReason) {
+    throw new Error(`LLM search planner reached max rounds (${AGENT_SEARCH_MAX_ROUNDS}) before enough evidence was selected; usable sources: ${usableSourceCount}.`);
+  }
+  appendSearchCompleteNode(run, {
+    parentId,
+    finishReason,
+    rounds: queryNodes.length,
+    sourceCount: usableSourceCount,
+    rationale: finishRationale,
+    planner: "llm_react"
+  });
+  return {
+    planner: "llm_react",
+    queryNodes,
+    searchResults,
+    rejectedSearches,
+    finishReason
+  };
+}
+
 async function executeRun(run) {
   return executeDeepResearchRun(run);
 }
@@ -3692,56 +4053,14 @@ async function executeDeepResearchRun(run) {
     await waitForRun(run, 850);
     await waitUntilRunnable(run);
 
-    const queryNodes = plan.searchQueries.map((query, index) => ({
-      id: `query-${index + 1}`,
-      kind: "search_query",
-      label: `检索分支 ${index + 1}`,
-      shortBody: query,
-      summary: `该检索分支服务于“${topicLabel(run.meta.question)}”：${query}`,
-      status: "observed",
-      cluster: "search",
-      parentId: "research-plan",
-      salience: 0.72,
-      confidence: 0.84,
-      attributes: {
-        query,
-        branch: String(index + 1)
-      },
-      episodes: [{ id: `query-${index + 1}-episode`, time: `00:0${index + 6}`, title: "Search branch planned", detail: query }]
-    }));
-    for (const queryNode of queryNodes) {
-      nodeEvent(run, "graph_build", `搜索分支生成：${queryNode.shortBody}`, queryNode);
-      edgeEvent(run, "graph_build", "Research plan 发出检索 query。", { id: `edge-plan-${queryNode.id}`, from: "research-plan", to: queryNode.id, kind: "queries", confidence: 0.84 });
-    }
-    clusterEvent(run, "graph_build", "Search cluster 已形成。", "search");
-    await waitForRun(run, 700);
-    await waitUntilRunnable(run);
-
-    const searchSettled = await Promise.allSettled(queryNodes.map((queryNode) =>
-      runRegisteredTool(run, registry, "search", { query: queryNode.shortBody, queryId: queryNode.id }, {
-        nodeExtra: {
-          salience: 0.5,
-          importance: 0.46
-        }
-      })
-    ));
-    const searchResults = searchSettled
-      .filter((result) => result.status === "fulfilled")
-      .map((result) => result.value);
-    const rejectedSearches = searchSettled.filter((result) => result.status === "rejected");
+    const searchPlan = shouldUseLlmSearchPlanner(run)
+      ? await runLlmDrivenSearchPlan({ run, registry, plan })
+      : await runDeterministicSearchPlan({ run, registry, plan });
+    const queryNodes = searchPlan.queryNodes;
+    const searchResults = searchPlan.searchResults;
+    const rejectedSearches = searchPlan.rejectedSearches;
     const usableSearchResults = searchResults.filter(hasUsableSearchObservation);
     const failedSearchResults = searchResults.filter((result) => !hasUsableSearchObservation(result));
-    for (const result of searchResults) {
-      if (result.output.queryId) {
-        edgeEvent(run, "graph_build", "Search tool 读取对应 query。", {
-          id: `edge-${result.output.queryId}-${result.toolCall.id}`,
-          from: result.output.queryId,
-          to: result.toolCall.id,
-          kind: "uses_tool",
-          confidence: result.ok ? 0.8 : 0.32
-        });
-      }
-    }
     if (usableSearchResults.length === 0) {
       const firstError = failedSearchResults[0]?.toolCall?.error || rejectedSearches[0]?.reason?.message || "no usable search branch";
       throw new Error(`Deep research search produced no usable sources: ${firstError}`);
@@ -3805,6 +4124,8 @@ async function executeDeepResearchRun(run) {
         confidence: searchStepStatus === "degraded" ? 0.62 : 0.84,
         executionStep: executionStep("search", searchStepStatus),
         attributes: {
+          planner: searchPlan.planner,
+          finishReason: searchPlan.finishReason,
           usableBranches: String(usableSearchResults.length),
           failedBranches: String(failedSearchResults.length + rejectedSearches.length),
           sources: String(sourceCandidates.length),

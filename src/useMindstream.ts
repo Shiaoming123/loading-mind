@@ -43,6 +43,63 @@ function fallbackRun(request: CreateRunRequest): AgentRun {
   };
 }
 
+async function readServerEventStream(
+  response: Response,
+  handlers: {
+    onRun: (run: AgentRun) => void;
+    onEvent: (event: AgentEvent) => void;
+  }
+) {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error("Run stream response did not include a readable body.");
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const processBlock = (block: string) => {
+    const lines = block.split(/\r?\n/);
+    const eventName = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() || "message";
+    const data = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (!data) {
+      return;
+    }
+    const payload = JSON.parse(data) as { run?: AgentRun } | AgentEvent;
+    if (eventName === "run-created" && "run" in payload && payload.run) {
+      handlers.onRun(payload.run);
+    } else if (eventName === "agent-event") {
+      handlers.onEvent(payload as AgentEvent);
+    } else if (eventName === "run-error" && "error" in payload) {
+      throw new Error(String(payload.error || "Run stream failed."));
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (value) {
+      buffer += decoder.decode(value, { stream: !done });
+      let separatorIndex = buffer.search(/\r?\n\r?\n/);
+      while (separatorIndex !== -1) {
+        const block = buffer.slice(0, separatorIndex);
+        const match = buffer.slice(separatorIndex).match(/^\r?\n\r?\n/);
+        buffer = buffer.slice(separatorIndex + (match?.[0].length ?? 2));
+        processBlock(block);
+        separatorIndex = buffer.search(/\r?\n\r?\n/);
+      }
+    }
+    if (done) {
+      break;
+    }
+  }
+  const trailing = buffer.trim();
+  if (trailing) {
+    processBlock(trailing);
+  }
+}
+
 export function useMindstream() {
   const [state, dispatch] = useReducer(mindstreamReducer, initialState);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -152,7 +209,11 @@ export function useMindstream() {
       try {
         const response = await fetch("/api/runs", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "X-Loading-Mind-Delivery": "stream"
+          },
           body: JSON.stringify(request)
         });
 
@@ -168,6 +229,15 @@ export function useMindstream() {
             }
           }
           throw new Error(message);
+        }
+
+        const contentType = response.headers.get("Content-Type") || "";
+        if (contentType.includes("text/event-stream")) {
+          await readServerEventStream(response, {
+            onRun: (run) => dispatch({ type: "START", run }),
+            onEvent: (event) => dispatch({ type: "APPLY_AGENT_EVENT", event })
+          });
+          return;
         }
 
         const payload = (await response.json()) as CreateRunResponse;

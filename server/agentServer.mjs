@@ -65,6 +65,7 @@ function addEvent(run, event) {
   };
   run.events.push(nextEvent);
   run.meta.updatedAt = now();
+  run.eventSink?.(nextEvent);
   broadcast(run, "agent-event", nextEvent);
   persist(run);
   return nextEvent;
@@ -4966,6 +4967,12 @@ export async function createRunSnapshot(body, options = {}) {
     forceDemoTools: options.forceDemoTools ?? false,
     ...options
   });
+  if (typeof options.onRun === "function") {
+    options.onRun(run.meta);
+  }
+  if (typeof options.onEvent === "function") {
+    run.eventSink = options.onEvent;
+  }
   await executeRun(run);
   return {
     run: run.meta,
